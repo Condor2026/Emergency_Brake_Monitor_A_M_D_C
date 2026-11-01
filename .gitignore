@@ -1,0 +1,85 @@
+# ==========================================
+# .gitignore para Emergency Brake Monitor (A.M.D.C.)
+# ==========================================
+
+# --- Entornos virtuales ---
+.venv/
+venv/
+ENV/
+env/
+.python-version
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Streamlit ---
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+# --- Bases de datos locales (SQLite) ---
+*.db
+*.sqlite
+*.sqlite3
+emergency_brake.db
+ebm.db
+
+# --- Cachés y archivos generados por el proyecto ---
+ebm_stations.json
+*.log
+*.tmp
+*.bak
+
+# --- Variables de entorno y secretos ---
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# --- Sistema operativo ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# --- IDEs y editores ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# --- Jupyter Notebooks (por si acaso) ---
+.ipynb_checkpoints/
+
+# --- Archivos de datos temporales ---
+*.csv
+*.json
+!package.json
+!requirements.txt
+
+# --- Archivos de audio generados temporalmente ---
+*.wav
+*.mp3
+
+# --- Carpetas de pruebas locales ---
+test/
+tests/
+__tests__/
