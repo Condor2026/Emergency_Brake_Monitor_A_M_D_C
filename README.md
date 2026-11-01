@@ -149,4 +149,3 @@ Este proyecto se distribuye bajo la licencia **MIT**. Eres libre de usarlo, modi
 
 > **"Que la alarma suene antes de que la única opción sea accionar el freno a mano."**
 > -CONDOR2026
-```
