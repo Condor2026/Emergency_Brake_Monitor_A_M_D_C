@@ -1,0 +1,24 @@
+# ==========================================
+# requirements.txt
+# Emergency Brake Monitor (A.M.D.C.)
+# ==========================================
+# Instalación:
+#   pip install -r requirements.txt
+#
+# Nota: El proyecto se ha desarrollado y probado principalmente con
+# Python 3.10+ y las versiones indicadas. Versiones más recientes
+# pueden funcionar, pero no están garantizadas.
+# ==========================================
+
+# --- Interfaz web y mapa interactivo ---
+streamlit>=1.30.0
+streamlit-folium>=0.18.0
+streamlit-autorefresh>=1.0.1
+folium>=0.15.0
+
+# --- Análisis de datos y cálculo numérico ---
+pandas>=2.0.0
+numpy>=1.24.0
+
+# --- Peticiones HTTP (feed de Renfe, Telegram, ntfy, webhooks) ---
+requests>=2.31.0
