@@ -24,6 +24,8 @@ Mientras todo eso pasaba, yo estaba construyendo otra cosa. Mientras otros se li
 
 Así nació **Emergency Brake Monitor**, un sistema que lleva las siglas **A.M.D.C.** en su nombre. No son siglas técnicas. Son las iniciales de **los maquinistas** que, en los accidentes ferroviarios de este país, **accionaron la palanca del freno como última opción**. Es un homenaje a ellos y a las víctimas. Y es, sobre todo, una promesa: **que otros no pasen por lo mismo**.
 
+![TheCondor](PANELCENTRAL.png) 
+
 ## 🛠️ ¿Qué es y para qué sirve?
 
 **Emergency Brake Monitor** no es una app de retrasos. Es un sistema de **alerta temprana y monitorización de seguridad ferroviaria** que utiliza datos públicos de posición de trenes (Renfe/Adif) para detectar situaciones de peligro en tiempo real.
