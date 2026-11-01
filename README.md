@@ -1,5 +1,5 @@
-
 # 🚆 Emergency Brake Monitor (A.M.D.C.)
+![TheCondor](EmergencyBrakeMonitorCondor.jpg)
 
 > **Prototipo experimental.** Herramienta de observación y alerta temprana para el seguimiento de trenes en tiempo real. Publicada como código abierto para que la comunidad pueda revisarla, mejorarla y utilizarla.
 
