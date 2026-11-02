@@ -82,6 +82,7 @@ El sistema se compone de varios módulos que trabajan en conjunto:
 - **Código abierto y modular.** Cualquiera puede revisarlo, mejorarlo o adaptarlo.
 
 **En resumen: no existe nada así en el mercado público.** Ni Renfe ni Adif ofrecen una herramienta de este tipo a los ciudadanos. Y aunque existen sistemas internos de seguridad (ASFA, ERTMS), no están al alcance del público ni son de código abierto. **Esta es una prueba de concepto de lo que la tecnología abierta puede hacer por la seguridad ferroviaria.**
+![TheCondor](Telemetria.pnj)
 
 ## ⚠️ Aviso Importante: Es un Prototipo (No sustituye nada)
 
