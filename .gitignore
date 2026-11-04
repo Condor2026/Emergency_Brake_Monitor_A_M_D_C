@@ -1,5 +1,5 @@
 # ==========================================
-# .gitignore para Emergency Brake Monitor (A.M.D.C.)
+# .gitignore para Emergency Brake Monitor (A.M.D.C.) — Condor2026
 # ==========================================
 
 # --- Entornos virtuales ---
@@ -35,6 +35,7 @@ ebm.db
 
 # --- Cachés y archivos generados por el proyecto ---
 ebm_stations.json
+ebm_monitor.pid
 *.log
 *.tmp
 *.bak
@@ -69,11 +70,12 @@ desktop.ini
 # --- Jupyter Notebooks (por si acaso) ---
 .ipynb_checkpoints/
 
-# --- Archivos de datos temporales ---
+# --- Archivos de datos temporales (cuidado: no excluir los que sí quieres subir) ---
 *.csv
 *.json
 !package.json
 !requirements.txt
+!*.geojson
 
 # --- Archivos de audio generados temporalmente ---
 *.wav
@@ -83,3 +85,7 @@ desktop.ini
 test/
 tests/
 __tests__/
+
+# --- Archivos de captura temporales ---
+*.png~
+*.jpg~
