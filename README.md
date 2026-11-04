@@ -8,6 +8,11 @@
 [![SQLite](https://img.shields.io/badge/SQLite-3-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 [![Prototype](https://img.shields.io/badge/Status-Prototype-yellow)](https://github.com/Condor2026/EmergencyBrakeMonitor)
+[![Railway Safety](https://img.shields.io/badge/Railway-Safety-critical?logo=train&logoColor=white)](https://github.com/topics/railway-safety)
+[![GTFS-RT](https://img.shields.io/badge/GTFS--RT-Real--Time-important)](https://gtfs.org/realtime/)
+[![OpenStreetMap](https://img.shields.io/badge/OpenStreetMap-Data-7EBC6F?logo=openstreetmap&logoColor=white)](https://www.openstreetmap.org/)
+[![Telegram](https://img.shields.io/badge/Telegram-Alerts-26A5E4?logo=telegram&logoColor=white)](https://telegram.org/)
+[![ntfy](https://img.shields.io/badge/ntfy-Push-317F43?logo=ntfy&logoColor=white)](https://ntfy.sh/)
 > **Prototipo experimental.** Herramienta de observación y alerta temprana para el seguimiento de trenes en tiempo real. Publicada como código abierto para que la comunidad pueda revisarla, mejorarla y utilizarla.
 
 ---
