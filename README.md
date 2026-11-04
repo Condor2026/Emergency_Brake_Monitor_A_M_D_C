@@ -47,8 +47,9 @@ Su objetivo principal es **prevenir alcances y accidentes** cuando un tren se de
 **La app sirve para que otros no pasen por lo mismo y lleguen a frenar a tiempo cuando se para un tren delante, como en España.** Para que la alarma suene antes de que la única opción sea accionar el freno a mano.
 
 ## ⚙️ ¿Cómo funciona? (Explicación técnica y detallada)
-
-El sistema se compone de varios módulos que trabajan en conjunto. Aquí tienes el desglose completo:
+![TheCondor](Registros.png)
+![TheCondor](Registros2.png)
+El sistema se compone de varios módulos que trabajan en conjunto. Desglose completo:
 
 ### 1. Monitor en segundo plano (hilo independiente)
 
