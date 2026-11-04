@@ -1,11 +1,11 @@
 # ⚠️ DISCLAIMER, TÉRMINOS DE USO Y LÍNEA ÉTICA
-**Emergency Brake Monitor (A.M.D.C.)**
+**Emergency Brake Monitor (A.M.D.C.) — Condor2026**
 
 ## 1. Propósito y homenaje
-Este proyecto nace como un **homenaje ético y respetuoso** a las víctimas de accidentes ferroviarios y a los maquinistas que, como última opción, accionaron la palanca del freno. No es un producto comercial, no busca lucro y no pretende sustituir a nadie. Su único fin es **concienciar y explorar** cómo la tecnología de código abierto puede contribuir a la seguridad ferroviaria.
+Este proyecto nace como un **homenaje ético y respetuoso** a las víctimas de accidentes ferroviarios y, en particular, a **los dos maquinistas que perdieron la vida la semana pasada en el accidente ferroviario de España**, y que, como última opción, accionaron la palanca del freno. No es un producto comercial, no busca lucro y no pretende sustituir a nadie. Su único fin es **concienciar y explorar** cómo la tecnología de código abierto puede contribuir a la seguridad ferroviaria.
 
 ## 2. Es un prototipo experimental (No es producción)
-Este software es un **prototipo funcional, pero inacabado**. No ha sido certificado, validado ni auditado por ninguna autoridad ferroviaria. **NO sustituye** a los sistemas oficiales de seguridad (ASFA, ERTMS, señalización, control de tráfico), ni a los maquinistas, ni a los protocolos de Renfe o Adif. La seguridad ferroviaria real requiere hardware certificado, validación humana y protocolos estrictos. **Este código es solo una prueba de concepto.**
+Este software es un **prototipo funcional, pero inacabado**. No ha sido certificado, validado ni auditado por ninguna autoridad ferroviaria. **NO sustituye** a los sistemas oficiales de seguridad (ASFA, ERTMS, LZB, señalización, control de tráfico), ni a los maquinistas, ni a los protocolos de Renfe o Adif. La seguridad ferroviaria real requiere hardware certificado, validación humana y protocolos estrictos. **Este código es solo una prueba de concepto.**
 
 ## 3. Uso bajo tu propio riesgo y responsabilidad
 El uso de este software es **exclusivamente bajo tu propio riesgo**. El autor no se hace responsable de daños directos o indirectos, pérdidas de datos, accidentes, sanciones o cualquier consecuencia derivada del uso de esta herramienta. **Tú eres el único responsable** de cómo utilices este código.
@@ -21,22 +21,37 @@ Este proyecto se comparte con la esperanza de que sea útil para el **bien comú
 **El autor se reserva el derecho de retirar o denunciar cualquier uso que considere un abuso de esta herramienta.** Si ves un uso indebido, repórtalo.
 
 ## 5. Canales de notificación (NO PROBADOS)
-El código incluye lógica para enviar alertas a Telegram, ntfy y webhooks, pero **estos canales NO han sido probados en un entorno real por el autor**. Si decides usarlos, hazlo bajo tu propia responsabilidad y prueba primero con el botón de "Enviar mensaje de prueba" incluido en la interfaz. No garantizamos su funcionamiento ni su seguridad.
+El código incluye lógica para enviar alertas a **Telegram, ntfy y webhooks**, pero **estos canales NO han sido probados en un entorno real por el autor**. La funcionalidad está implementada pero no validada con credenciales reales ni servidores en producción. Si decides usarlos, hazlo bajo tu propia responsabilidad y prueba primero con el botón de "Enviar mensaje de prueba" incluido en la interfaz. No garantizamos su funcionamiento ni su seguridad.
 
 ## 6. Datos y precisión
 El sistema utiliza datos públicos de posición de trenes (Renfe/Adif) y heurísticas de cálculo. **Los datos pueden tener retraso, errores o estar incompletos.** Las alertas generadas son aproximaciones y no deben tomarse como verdades absolutas. No uses este sistema como única fuente para tomar decisiones críticas.
 
 ## 7. Propiedad intelectual y licencia
-Este proyecto se distribuye bajo la licencia **MIT**. Eres libre de usarlo, modificarlo y distribuirlo, siempre que se mantenga el aviso de copyright y se reconozca la autoría original. **El autor es el dueño de la licencia y de la obra original.** No se permite el uso de este código para fines comerciales sin permiso expreso, ni su inclusión en productos que contradigan la línea ética aquí descrita.
+Este proyecto se distribuye bajo la licencia **Creative Commons Reconocimiento-NoComercial-CompartirIgual 4.0 Internacional (CC BY-NC-SA 4.0)**.
+
+**Eres libre de:**
+- Compartir: copiar y redistribuir el material en cualquier medio o formato.
+- Adaptar: remezclar, transformar y construir a partir del material.
+
+**Bajo los siguientes términos:**
+- **Reconocimiento (BY):** Debes otorgar el crédito correspondiente (Condor2026), proporcionar un enlace a la licencia e indicar si se realizaron cambios.
+- **NoComercial (NC):** **No puedes utilizar el material con fines comerciales.** Esto incluye, sin limitación, vender el software, ofrecerlo como servicio de pago, incluirlo en un producto comercial o utilizarlo para generar ingresos directos o indirectos.
+- **CompartirIgual (SA):** Si remezclas, transformas o construyes a partir del material, debes distribuir tus contribuciones bajo la misma licencia que el original. Esto garantiza que el proyecto y sus derivados sigan siendo **libres, gratuitos y de acceso abierto para siempre**.
+
+**El autor es el dueño de la licencia y de la obra original (Condor2026).** No se permite el uso de este código para fines comerciales sin permiso expreso, ni su inclusión en productos que contradigan la línea ética aquí descrita.
+
+Puedes leer el texto completo de la licencia en el archivo [LICENSE](LICENSE) o en [https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode.es](https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode.es).
 
 ## 8. Colaboración y mejora continua
 Este proyecto es de **código abierto** y está abierto a la colaboración. Si mejoras el código, corriges errores o añades funcionalidades, hazlo con respeto y transparencia. **No busco dinero ni protagonismo; busco que la idea viva y evolucione para el bien común.** Pero exijo que se mantenga la línea ética y útil de esta herramienta.
 
 ## 9. Contacto
-Si tienes dudas sobre este disclaimer, quieres reportar un mal uso o necesitas aclaraciones, contacta con el autor a través de los canales oficiales del repositorio (Issues). 
+Si tienes dudas sobre este disclaimer, quieres reportar un mal uso o necesitas aclaraciones, contacta con el autor a través de los canales oficiales del repositorio (Issues).
 
 ---
 
 > **"Que la alarma suene antes de que la única opción sea accionar el freno a mano."**
 > 
 > *— En memoria de las víctimas y de los maquinistas que, como última opción, accionaron la palanca del freno.*
+> 
+> **— Condor2026**
