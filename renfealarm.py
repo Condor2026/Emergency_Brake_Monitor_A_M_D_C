@@ -16,7 +16,10 @@ import inspect
 import io
 import json
 import math
+import atexit
+import hmac
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -24,6 +27,7 @@ import threading
 import time
 import unicodedata
 import wave
+import zipfile
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -106,6 +110,7 @@ button[kind="primary"] { background:#ff2d2d !important; border:0 !important; col
 .msg.brake { border-color:#e67e22; } .msg.brake b { color:#f39c4a; }
 .msg.early { border-color:#f1c40f; } .msg.early b { color:#f1c40f; }
 .msg.system { border-color:#8b949e; } .msg.system b { color:#aab4be; }
+.msg.close { border-color:#ff1fa3; } .msg.close b { color:#ff5cc0; }
 .nominal { color:#39ff88; font-family:'B612 Mono',monospace; font-size:12px; padding:8px; }
 
 /* Llegadas con retraso */
@@ -147,15 +152,28 @@ button[kind="primary"] { background:#ff2d2d !important; border:0 !important; col
 URL_FLOTA = "https://tiempo-real.largorecorrido.renfe.com/renfe-visor/flotaLD.json"
 URL_ESTACIONES = "https://tiempo-real.largorecorrido.renfe.com/renfe-visor/estaciones.geojson"
 URL_RUTAS = "https://tiempo-real.largorecorrido.renfe.com/renfe-visor/trenesConEstacionesLD.json"
+# Red completa: Cercanías / Rodalies / Tram en GTFS-RT (posiciones verificadas; retrasos y avisos: URLs habituales de Renfe)
+URL_CERC_POS = "https://gtfsrt.renfe.com/vehicle_positions.json"
+URL_CERC_TRIPS = "https://gtfsrt.renfe.com/trip_updates.json"
+URL_CERC_ALERTS = "https://gtfsrt.renfe.com/alerts.json"
+# GTFS estático de Renfe (stops.txt = estaciones con el MISMO código que usan los feeds)
+# Listado oficial de estaciones de Renfe (código, nombre, coordenadas, provincia) — datos abiertos CC BY 4.0
+RENFE_STATIONS_CSV_URLS = [
+    "https://data.renfe.com/dataset/ed3d44e5-1d04-41d6-9aa5-396442bf3e07/resource/783e0626-6fa8-4ac7-a880-fa53144654ff/download/listado-estaciones-completo-act.csv",
+    "https://ssl.renfe.com/ftransit/Fichero_estaciones/estaciones.csv"]
+EXTRA_POS_URLS = [u.strip() for u in os.getenv("EBM_EXTRA_GTFSRT", "").split(",") if u.strip().startswith(("http://", "https://"))]
+GTFS_URLS = ["https://ssl.renfe.com/ftransit/Fichero_CER_FOMENTO/fomento_transit.zip",
+             "https://ssl.renfe.com/gtransit/Fichero_AV_LD/google_transit.zip"]
 
 # Código de producto de Renfe (tabla contrastada con el visor público)
-NOM_PROD = {2: "AVE", 25: "AVE", 28: "Avlo", 3: "Avant", 11: "Alvia", 10: "Euromed", 13: "Intercity",
+NOM_PROD = {99: "Simulacro", 200: "Cercanías", 201: "Rodalies", 2: "AVE", 25: "AVE", 28: "Avlo", 3: "Avant", 11: "Alvia", 10: "Euromed", 13: "Intercity",
             4: "Talgo", 5: "Altaria", 7: "Diurno", 8: "Estrella", 9: "Tren Hotel", 24: "AV City",
             14: "Andalucía Exprés", 15: "Catalunya Exprés", 16: "Media Distancia", 18: "Regional",
             19: "Regional Exprés", 20: "TRD"}
 GRUPOS = {"AVE": [2, 25], "Avlo": [28], "Avant": [3], "Alvia": [11],
           "Euromed e Intercity": [10, 13, 4, 5, 7, 8, 9, 24],
-          "Media distancia y regionales": [14, 15, 16, 18, 19, 20]}
+          "Media distancia y regionales": [14, 15, 16, 18, 19, 20],
+          "Cercanías y Rodalies": [200, 201]}
 
 CORTOS = {"60000": "Madrid Atocha", "17000": "Madrid Chamartín", "18000": "Madrid Atocha",
           "10000": "Madrid Príncipe Pío", "71801": "Barcelona Sants", "79400": "Barcelona França",
@@ -191,13 +209,22 @@ RETENTION_DAYS = 30           # memoria de incidentes y tramos (SQLite)
 MASS_LIMIT = 6
 
 DEFAULT_CFG = {
-    "early_stop_s": 30, "min_stop_s": 60, "station_radius_m": 1000,
+    "early_stop_s": 45, "min_stop_s": 120, "station_radius_m": 1200,
     "risk_dist_m": 5000, "risk_ttc_s": 120, "risk_heading_deg": 60, "risk_min_kmh": 30,
     "risk_include_suspect": True,
-    "brake_min_kmh": 80, "brake_ms2": 0.9, "brake_station_m": 3000, "brake_hold_s": 120,
-    "push_min_rank": 1,
-    "accident_s": 240,          # detenido tanto tiempo lejos de estación => posible accidente
+    "brake_min_kmh": 100, "brake_ms2": 1.0, "brake_station_m": 3000, "brake_hold_s": 120,
+    "push_min_rank": 3,
+    "accident_s": 600,          # detenido tanto tiempo lejos de estación => posible accidente
+    "accident_max": 2,          # más candidatos simultáneos que esto = fallo de datos/calibración, no accidentes
+    "cerc_stop_mult": 3,        # Cercanías: posiciones menos fiables => los tiempos se multiplican por esto
     "cut_half_km": 5,           # semilongitud (km) del tramo cortado automático alrededor del tren
+    "close_on": True,           # detección de aproximación entre trenes por velocidades
+    "close_gap_m": 8000,        # hueco máximo entre seguidor y tren de delante
+    "close_closing_kmh": 30,    # el seguidor debe ir al menos así de más rápido
+    "close_ttc_s": 120,         # aviso si alcanzaría al de delante en menos de esto
+    "close_decel": 0.6,         # frenado de servicio supuesto (m/s²)
+    "close_lateral_m": 250,     # desvío lateral máximo para considerar "misma vía"
+    "close_heading_deg": 35,    # tolerancia de rumbo entre ambos trenes
     "gps_stale_s": 600,         # señal GPS más antigua que esto => tren "sin señal": no genera alarmas
     "cut_warn_m": 10000,        # distancia a la que un tren que se acerca a un tramo cortado genera aviso
 }
@@ -207,13 +234,14 @@ LEVELS = {
     "brake":    {"label": "FRENADA BRUSCA",    "icon": "🟠", "color": "#e67e22", "rank": 2, "beeps": 3, "repeat_s": 300},
     "stopped":  {"label": "DETENIDO EN VÍA",   "icon": "🔴", "color": "#ff3232", "rank": 3, "beeps": 4, "repeat_s": 120},
     "accident": {"label": "POSIBLE ACCIDENTE",  "icon": "💥", "color": "#ff0000", "rank": 5, "beeps": 10, "repeat_s": 60},
+    "close":    {"label": "APROXIMACIÓN PELIGROSA", "icon": "⚡", "color": "#ff1fa3", "rank": 3, "beeps": 5, "repeat_s": 60},
     "risk":     {"label": "RIESGO CRÍTICO",    "icon": "🚨", "color": "#ff0000", "rank": 4, "beeps": 8, "repeat_s": 30},
     "system":   {"label": "AVISO DEL SISTEMA", "icon": "⚠", "color": "#8b949e", "rank": 0, "beeps": 1, "repeat_s": 900},
     "resolved": {"label": "RESUELTO",          "icon": "✅", "color": "#2ecc71", "rank": 0, "beeps": 0, "repeat_s": 10 ** 9},
 }
 
 BASE_COLUMNS = [
-    "cod_comercial", "tipo", "grupo", "cod_prod", "lat", "lon", "retraso_min", "speed_kmh", "inst_kmh",
+    "cod_comercial", "tipo", "grupo", "src", "status", "delay_known", "cod_prod", "lat", "lon", "retraso_min", "speed_kmh", "inst_kmh",
     "prev_inst_kmh", "decel_ms2", "gps_age_s", "heading", "has_heading", "stopped_for_s", "dist_to_station",
     "est_ant", "est_sig", "origen", "destino", "hora_sig", "mat", "accesible",
 ]
@@ -294,6 +322,8 @@ def nearest_station_m(lat, lon, stations_arr):
 
 
 def grupo_de(code):
+    if code == 99:
+        return "Simulacro"
     for name, codes in GRUPOS.items():
         if code in codes:
             return name
@@ -330,22 +360,6 @@ def label_est(code, info):
         n = str(n).split("/")[0].replace(" - ", " ").strip()
         return n if len(n) <= 28 else n[:27] + "…"
     return f"estación {code}"
-
-
-def in_zone(zone, code, info):
-    for name, provs, box in ZONAS:
-        if name != zone:
-            continue
-        if provs is None:
-            return True
-        e = info.get(norm_code(code))
-        if not e:
-            return False
-        p = norm_text(e.get("prov"))
-        if p:
-            return any(p == x or p.endswith(" " + x) or p.startswith(x + " ") for x in provs)
-        return bool(box) and box[0] <= e["lat"] <= box[1] and box[2] <= e["lon"] <= box[3]
-    return True
 
 
 def seg_nearest(lat, lon, a, b):
@@ -393,7 +407,7 @@ def parse_iso_ts(v):
 def parse_latlon_list(text):
     """'40.1,-3.7; 38.0,-4.5' -> [(40.1,-3.7),(38.0,-4.5)]"""
     pts = []
-    for chunk in str(text or "").replace("\n", ";").split(";"):
+    for chunk in str(text or "").replace("\n", ";").split(";")[:500]:
         parts = chunk.replace(" ", "").split(",")
         if len(parts) == 2:
             la, lo = to_float(parts[0]), to_float(parts[1])
@@ -420,6 +434,47 @@ def sparkline(values, w=230, h=46, color="#35d0ff"):
     pts = " ".join(f"{i * w / (len(values) - 1):.1f},{h - 3 - (v / vmax) * (h - 6):.1f}" for i, v in enumerate(values))
     return (f'<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" style="background:#070c12;border-radius:3px">'
             f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="2"/></svg>')
+
+
+def where_text(ant, sig, info):
+    ant, sig = norm_code(ant), norm_code(sig)
+    if ant and ant == sig:
+        return f"En {label_est(ant, info)}"
+    if ant and sig:
+        return f"Entre {label_est(ant, info)} y {label_est(sig, info)}"
+    if sig:
+        return f"Hacia {label_est(sig, info)}"
+    if ant:
+        return f"Tras {label_est(ant, info)}"
+    return ""
+
+
+def train_in_zone(zone, row, info):
+    """
+    ¿Va el tren a esa zona? Orden de intentos: provincia de la estación destino -> nombre de la estación (o de CORTOS)
+    -> coordenadas de la estación -> posición actual del tren dentro de la zona (si no se conoce el destino).
+    """
+    z = next((x for x in ZONAS if x[0] == zone), None)
+    if z is None or z[1] is None:
+        return True
+    provs, box = z[1], z[2]
+    code = norm_code(row["destino"])
+    e = info.get(code)
+    if e:
+        p = norm_text(e.get("prov"))
+        if p and any(p == x or p.endswith(" " + x) or p.startswith(x + " ") for x in provs):
+            return True
+        nm = norm_text(e.get("n"))
+        if nm and any(x in nm for x in provs):
+            return True
+        if box and box[0] <= e["lat"] <= box[1] and box[2] <= e["lon"] <= box[3]:
+            return True
+        if p or nm:      # la estación se conoce y no está en esta zona
+            return False
+    nm = norm_text(CORTOS.get(code, ""))
+    if nm and any(x in nm for x in provs):
+        return True
+    return bool(box) and box[0] <= row["lat"] <= box[1] and box[2] <= row["lon"] <= box[3]
 
 
 def stretch_kwargs(func):
@@ -483,30 +538,268 @@ def parse_stations(data):
             lat, lon = to_float(pick(props, ["latitud", "lat", "latitude"])), to_float(pick(props, ["longitud", "lon", "lng", "longitude"]))
         if lat is None or lon is None:
             continue
-        code = pick(props, ["codigo", "cod_estacion", "codEstacion", "codigoEstacion", "cdgoUIC", "id"]) or f.get("id")
-        name = pick(props, ["nombre", "name", "nombreEstacion", "descripcion", "desc", "estacion"])
-        prov = pick(props, ["provincia", "province"])
-        out.append({"code": norm_code(code), "n": name or "", "prov": prov or "", "lat": lat, "lon": lon})
+        code = pick(props, ["codigo", "cod_estacion", "codEstacion", "codigoEstacion", "cdgoUIC", "codEst", "uic", "id"]) \
+            or f.get("id")
+        if not code:  # último recurso: cualquier propiedad que parezca un código numérico de estación
+            code = next((v for v in props.values() if isinstance(v, (str, int)) and str(v).strip().isdigit()
+                         and 4 <= len(str(v).strip()) <= 6), None)
+        name = pick(props, ["nombre", "name", "nombreEstacion", "nombre_estacion", "descripcion", "desc", "estacion",
+                            "nom", "label", "title", "station_name"])
+        prov = pick(props, ["provincia", "province", "prov"])
+        out.append({"code": norm_code(code), "n": str(name or ""), "prov": str(prov or ""), "lat": lat, "lon": lon})
+    return out
+
+
+OVERPASS_URLS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"]
+OVERPASS_QUERY = ('[out:json][timeout:90];area["ISO3166-1"="ES"][admin_level=2]->.es;'
+                  '(node["railway"="station"]["station"!~"subway|light_rail|tram|monorail|funicular"](area.es);'
+                  'node["railway"="halt"](area.es););out body;')
+
+
+def parse_overpass(data):
+    """Estaciones de OpenStreetMap (Overpass JSON) -> mismo formato que parse_stations."""
+    out = []
+    for el in (data or {}).get("elements", []):
+        lat, lon = to_float(el.get("lat")), to_float(el.get("lon"))
+        if lat is None or lon is None:
+            continue
+        tags = el.get("tags") or {}
+        uic = str(tags.get("uic_ref") or "").strip()
+        out.append({"code": norm_code(uic[-5:]) if uic.isdigit() else "", "n": str(tags.get("name") or ""),
+                    "prov": str(tags.get("addr:province") or tags.get("is_in:province") or ""), "lat": lat, "lon": lon})
+    return out
+
+
+def parse_gtfs_stops_zip(content):
+    """stops.txt de un GTFS (zip) -> estaciones con el código de Renfe (stop_id)."""
+    import csv
+    out = []
+    with zipfile.ZipFile(io.BytesIO(content)) as z:
+        name = next((n for n in z.namelist() if n.lower().endswith("stops.txt")), None)
+        if not name or z.getinfo(name).file_size > 150 * 1024 * 1024:   # tope contra "zip bombs"
+            return out
+        with z.open(name) as f:
+            for r in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
+                lat, lon = to_float(r.get("stop_lat")), to_float(r.get("stop_lon"))
+                if lat is None or lon is None:
+                    continue
+                out.append({"code": norm_code(r.get("stop_id")), "n": (r.get("stop_name") or "").strip(), "prov": "",
+                            "lat": lat, "lon": lon})
+    return out
+
+
+def _d(x):
+    return x if isinstance(x, dict) else {}
+
+
+def parse_gtfsrt_vehicles(data):
+    """Cercanías/Rodalies (GTFS-RT vehicle_positions.json) -> trenes con el mismo formato que flotaLD."""
+    out = []
+    for ent in _d(data).get("entity", []) or []:
+        try:
+            v = _d(_d(ent).get("vehicle"))
+            pos = _d(v.get("position"))
+            lat, lon = to_float(pos.get("latitude")), to_float(pos.get("longitude"))
+            if lat is None or lon is None:
+                continue
+            veh = _d(v.get("vehicle"))
+            label = str(veh.get("label") or veh.get("id") or _d(ent).get("id") or "")
+            parts = label.split("-")
+            line = parts[0] if parts else ""
+            num = str(veh.get("id") or (parts[1] if len(parts) > 1 else ""))
+            cod = f"{line}-{num}" if line and num else (label or str(_d(ent).get("id") or ""))
+            status = str(v.get("currentStatus") or "")
+            stop = norm_code(v.get("stopId"))
+            out.append({"codComercial": cod, "codProduct": 201 if line.upper().startswith("R") else 200,
+                        "latitud": lat, "longitud": lon, "ultRetraso": None, "time": to_float(v.get("timestamp")),
+                        "codEstAnt": stop if status == "STOPPED_AT" else "", "codEstSig": stop, "codOrigen": "",
+                        "codDestino": "", "mat": label, "accesible": False, "_src": "CERC", "_status": status,
+                        "_trip": str(_d(v.get("trip")).get("tripId") or ""), "_delay_known": False})
+        except (AttributeError, TypeError, ValueError):
+            continue    # una entidad malformada no descarta al resto
+    return out
+
+
+def parse_gtfsrt_delays(data):
+    """tripId -> retraso en minutos (GTFS-RT trip_updates)."""
+    out = {}
+    for ent in (data or {}).get("entity", []) or []:
+        tu = ent.get("tripUpdate") if isinstance(ent, dict) else None
+        if not isinstance(tu, dict):
+            continue
+        trip = (tu.get("trip") or {}).get("tripId")
+        if not trip:
+            continue
+        d = to_float(tu.get("delay"))
+        if d is None:
+            for stu in tu.get("stopTimeUpdate") or []:
+                for k in ("arrival", "departure"):
+                    d = to_float((stu.get(k) or {}).get("delay"))
+                    if d is not None:
+                        break
+                if d is not None:
+                    break
+        if d is not None:
+            out[str(trip)] = int(round(d / 60.0))
+    return out
+
+
+def parse_gtfsrt_alerts(data, now=None):
+    """Avisos oficiales (GTFS-RT alerts) -> mismo formato que las incidencias."""
+    now = now or time.time()
+    out = []
+
+    def text(x):
+        tr = (x or {}).get("translation") or []
+        if not tr:
+            return ""
+        best = next((t for t in tr if str(t.get("language", "")).lower().startswith("es")), tr[0])
+        return str(best.get("text", ""))
+
+    for ent in (data or {}).get("entity", []) or []:
+        a = ent.get("alert") if isinstance(ent, dict) else None
+        if not isinstance(a, dict):
+            continue
+        periods = a.get("activePeriod") or []
+        if periods and not any((to_float(p.get("start")) or 0) <= now <= (to_float(p.get("end")) or 1e18) for p in periods):
+            continue
+        effect = str(a.get("effect") or "")
+        nivel = "grave" if effect in ("NO_SERVICE", "SIGNIFICANT_DELAYS", "DETOUR", "STOP_MOVED") else \
+            "leve" if effect in ("REDUCED_SERVICE", "MODIFIED_SERVICE", "ADDITIONAL_SERVICE") else "info"
+        ents = sorted({str(ie.get("routeId") or ie.get("stopId") or "") for ie in (a.get("informedEntity") or [])} - {""})
+        out.append({"titulo": text(a.get("headerText")) or "Aviso", "texto": text(a.get("descriptionText")),
+                    "ambito": ", ".join(ents)[:140], "nivel": nivel, "pts": [], "fuente": "Renfe (GTFS-RT)",
+                    "causa": classify_cause(text(a.get("headerText")) + " " + text(a.get("descriptionText")))})
+    return out
+
+
+# Último recurso si NO hay descarga ni copia: estaciones principales (coordenadas aproximadas, lista PARCIAL).
+BASIC_STATIONS = [
+    ("60000", "Madrid Puerta de Atocha", 40.4065, -3.6894), ("17000", "Madrid Chamartín", 40.4722, -3.6829),
+    ("71801", "Barcelona Sants", 41.3791, 2.1400), ("03216", "València Joaquín Sorolla", 39.4590, -0.3770),
+    ("65000", "València Nord", 39.4666, -0.3774), ("51003", "Sevilla Santa Justa", 37.3922, -5.9755),
+    ("54413", "Málaga María Zambrano", 36.7114, -4.4325), ("50500", "Córdoba Central", 37.8918, -4.7905),
+    ("04040", "Zaragoza Delicias", 41.6587, -0.9112), ("60911", "Alicante Terminal", 38.3452, -0.4966),
+    ("08223", "Vigo Urzáiz", 42.2380, -8.7132), ("31412", "A Coruña", 43.3533, -8.4093),
+    ("15100", "León", 42.5946, -5.5804), ("15211", "Oviedo", 43.3547, -5.8523),
+    ("11511", "San Sebastián", 43.3051, -1.9860), ("60600", "Albacete Los Llanos", 38.9999, -1.8567),
+    ("03208", "Cuenca Fernando Zóbel", 39.9951, -2.1288), ("04007", "Guadalajara Yebes", 40.6893, -3.0996),
+    ("08004", "Segovia Guiomar", 40.9068, -4.1019), ("04104", "Camp de Tarragona", 41.1888, 1.1418),
+    ("04307", "Figueres Vilafant", 42.2637, 2.9452), ("", "Valladolid Campo Grande", 41.6425, -4.7267),
+    ("", "Bilbao Abando", 43.2608, -2.9292), ("", "Santiago de Compostela", 42.8667, -8.5334),
+    ("", "Pamplona", 42.8113, -1.6487), ("", "Granada", 37.1861, -3.6081), ("", "Burgos Rosa Manzano", 42.3568, -3.6226),
+    ("", "Salamanca", 40.9515, -5.6697), ("", "Murcia del Carmen", 37.9844, -1.1297), ("", "Cartagena", 37.5990, -0.9760),
+    ("", "Almería", 36.8411, -2.4580), ("", "Huelva", 37.2570, -6.9396), ("", "Cádiz", 36.5303, -6.2917),
+    ("", "Jerez de la Frontera", 36.6881, -6.1288), ("", "Badajoz", 38.8788, -6.9694), ("", "Cáceres", 39.4619, -6.3722),
+    ("", "Toledo", 39.8636, -4.0197), ("", "Ciudad Real", 38.9830, -3.9253), ("", "Puertollano", 38.6853, -4.1004),
+    ("", "Lleida Pirineus", 41.6086, 0.6322), ("", "Girona", 41.9793, 2.8180), ("", "Huesca", 42.1342, -0.4090),
+    ("", "Logroño", 42.4672, -2.4442), ("", "Vitoria-Gasteiz", 42.8446, -2.6850), ("", "Santander", 43.4613, -3.8153),
+    ("", "Gijón Sanz Crespo", 43.5426, -5.6620), ("", "Lugo", 43.0068, -7.5561), ("", "Ourense", 42.3547, -7.8586),
+    ("", "Pontevedra", 42.4326, -8.6413)]
+
+
+def basic_stations():
+    return [{"code": c, "n": n, "prov": "", "lat": la, "lon": lo} for c, n, la, lo in BASIC_STATIONS]
+
+
+MAX_BYTES = 40 * 1024 * 1024    # tope por descarga (evita agotar la memoria con respuestas gigantes)
+
+
+def read_capped(resp, max_bytes=MAX_BYTES):
+    """Lee el cuerpo de una respuesta con tope de tamaño (acepta también objetos simples con .content)."""
+    n = to_float((getattr(resp, "headers", None) or {}).get("Content-Length")) or 0
+    if n > max_bytes:
+        raise ValueError("respuesta demasiado grande")
+    if hasattr(resp, "iter_content"):
+        buf = bytearray()
+        for chunk in resp.iter_content(65536):
+            buf += chunk
+            if len(buf) > max_bytes:
+                resp.close()
+                raise ValueError("respuesta demasiado grande")
+        return bytes(buf)
+    return resp.content
+
+
+def valid_http_url(u):
+    from urllib.parse import urlparse
+    try:
+        p = urlparse(str(u).strip())
+    except ValueError:
+        return False
+    return p.scheme in ("http", "https") and bool(p.netloc)
+
+
+def valid_topic(t):
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(t).strip()))
+
+
+def decode_text(content):
+    """bytes -> texto probando las codificaciones habituales (utf-8, utf-16 con BOM, cp1252, latin-1)."""
+    if content[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            return content.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return content.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return content.decode("latin-1", "ignore")
+
+
+def _num(v):
+    f = to_float(v)
+    if f is None and isinstance(v, str):
+        f = to_float(v.strip().replace(",", "."))
+    return f
+
+
+def _guess_stations_from_rows(text, delim):
+    """Plan B: detecta columnas por sus valores (lat 27-44,5; lon -19..5,5 con decimales; código de 4-6 dígitos)."""
+    import csv
+    import re
+    out = []
+    for row in csv.reader(io.StringIO(text), delimiter=delim):
+        cells = [c.strip() for c in row]
+        dec = [(_num(c), c) for c in cells if c and ("." in c or ",") and re.fullmatch(r"-?\d+[.,]\d+", c)]
+        lat = next((v for v, _ in dec if v is not None and 27.0 <= v <= 44.5), None)
+        lon = next((v for v, _ in dec if v is not None and -19.0 <= v <= 5.5), None)
+        if lat is None or lon is None:
+            continue
+        name = next((c for c in cells if re.search(r"[A-Za-zÁÉÍÓÚÜáéíóúüÑñ]", c) and not re.fullmatch(r"-?\d+[.,]\d+", c)), "")
+        code = next((c for c in cells if c.isdigit() and 4 <= len(c) <= 6), "")
+        out.append({"code": norm_code(code), "n": name, "prov": "", "lat": lat, "lon": lon})
     return out
 
 
 def parse_stations_csv(text):
-    """CSV con cabecera: lat, lon y opcionalmente codigo, nombre, provincia."""
+    """CSV con cabecera (separador ; , o tab; decimales con coma): lat/lon y opcionalmente código, nombre, provincia."""
     import csv
+    text = (text or "").lstrip("\ufeff")
+    head = text.splitlines()[0] if text else ""
+    delim = "\t" if "\t" in head else (";" if head.count(";") >= head.count(",") and ";" in head else ",")
     out = []
-    for r in csv.DictReader(io.StringIO(text)):
-        lat, lon = to_float(pick(r, ["lat", "latitud", "latitude"])), to_float(pick(r, ["lon", "lng", "longitud", "longitude"]))
+    for r in csv.DictReader(io.StringIO(text), delimiter=delim):
+        r = {norm_text(k).lower(): v for k, v in r.items() if k}
+        lat = _num(pick(r, ["latitud", "lat", "latitude"]))
+        lon = _num(pick(r, ["longitud", "lon", "lng", "longitude"]))
         if lat is None or lon is None:
             continue
-        out.append({"code": norm_code(pick(r, ["codigo", "code", "cod"])), "n": pick(r, ["nombre", "name"]) or "",
-                    "prov": pick(r, ["provincia", "prov"]) or "", "lat": lat, "lon": lon})
-    return out
+        if abs(lat) > 90 or abs(lon) > 180:
+            continue
+        out.append({"code": norm_code(pick(r, ["codigo", "cod estacion", "codigo estacion", "cod", "code", "stop id", "id"])),
+                    "n": str(pick(r, ["descripcion", "nombre", "name", "nombre estacion", "estacion"]) or "").strip(),
+                    "prov": str(pick(r, ["provincia", "prov", "province"]) or "").strip(), "lat": lat, "lon": lon})
+    return out or _guess_stations_from_rows(text, delim)
 
 
 def save_stations_cache(stations):
     try:
         with open(STATIONS_CACHE, "w", encoding="utf-8") as f:
             json.dump(stations, f)
+        os.chmod(STATIONS_CACHE, 0o600)
     except OSError:
         pass
 
@@ -517,24 +810,6 @@ def load_stations_cache():
             return [x for x in json.load(f) if isinstance(x, dict) and "lat" in x and "lon" in x]
     except (OSError, ValueError, TypeError):
         return []
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_stations():
-    r = get_session().get(URL_ESTACIONES, timeout=10)  # si falla lanza: no se cachea vacío
-    r.raise_for_status()
-    return parse_stations(r.json())
-
-
-def load_stations():
-    try:
-        stations = fetch_stations()
-        if stations:
-            st.session_state.last_stations = stations
-            return stations
-    except (requests.RequestException, ValueError):
-        pass
-    return st.session_state.get("last_stations", [])
 
 
 @st.cache_data(ttl=5, show_spinner=False)
@@ -556,6 +831,28 @@ def load_feed():
     return (last[0], last[1], True) if last else (None, None, True)
 
 
+CAUSAS = [
+    ("Accidente / persona en la vía", ("atropell", "persona en la v", "persona en vi", "accidente", "arrollad", "colisi", "descarril")),
+    ("Incendio", ("incendio", "fuego", "humo")),
+    ("Meteorología", ("lluvia", "temporal", "inunda", "dana", "viento", "nieve", "tormenta", "meteorol", "aemet", "desprendimiento", "riada")),
+    ("Seguridad / vandalismo", ("robo", "vandal", "sabotaje", "intrusi", "cable robado")),
+    ("Infraestructura", ("infraestructura", "catenaria", "senaliz", "aguja", "paso a nivel", "electrific", "suministro", "tension", "averia en la via",
+                         "incidencia en la via", "via ", "via.")),
+    ("Material rodante", ("averia del tren", "averia en el tren", "tren averiado", "material rodante", "averia tecnica")),
+    ("Obras / mantenimiento", ("obras", "mantenimiento", "trabajos", "actuacion programada", "corte programado")),
+    ("Personal / huelga", ("huelga", "servicios minimos", "falta de personal", "paro ")),
+]
+
+
+def classify_cause(text):
+    """Causa deducida del propio texto del aviso; si no la dice: 'Motivo no comunicado'."""
+    t = "".join(c for c in unicodedata.normalize("NFD", str(text or "").lower()) if unicodedata.category(c) != "Mn")
+    for name, keys in CAUSAS:
+        if any(k in t for k in keys):
+            return name
+    return "Motivo no comunicado"
+
+
 def parse_incidents(data):
     """Normaliza avisos de Adif de un JSON (lista, o dict con lista en incidencias/avisos/items/data)."""
     items = data
@@ -575,7 +872,8 @@ def parse_incidents(data):
         nivel = "grave" if any(k in blob for k in ("SUSPEND", "INTERRUMP", "CORTE", "CORTADA", "ACCIDENTE")) \
             else "leve" if any(k in blob for k in ("RETRASO", "LIMITACION", "AFECTA", "INCIDENCIA")) else "info"
         out.append({"titulo": str(title), "texto": str(text), "ambito": str(scope), "nivel": nivel,
-                    "pts": parse_tramo(pick(it, ["tramo", "puntos", "geometry"]))})
+                    "pts": parse_tramo(pick(it, ["tramo", "puntos", "geometry"])),
+                    "causa": classify_cause(f"{title} {text}")})
     return out
 
 
@@ -586,11 +884,9 @@ _TIME_KEYS = ["horaLlegada", "horaLlegadaPlanificada", "horaProgramada", "horaPr
 
 
 def _hhmm(v):
-    """'2026-10-31T21:40:00' o '21:40' -> '21:40' ('' si no es una hora)."""
-    v = str(v or "")
-    if "T" in v and len(v) >= 16:
-        return v[11:16]
-    return v[:5] if len(v) >= 5 and v[2] == ":" else ""
+    """'2026-10-31T21:40:00' o '21:40' -> '21:40' ('' si no es una hora). Solo dígitos: seguro para HTML."""
+    m = re.search(r"(?:^|[T ])([01]\d|2[0-3]):([0-5]\d)", str(v or ""))
+    return f"{m.group(1)}:{m.group(2)}" if m else ""
 
 
 def add_minutes_hhmm(hhmm, minutes):
@@ -698,6 +994,10 @@ def db_init():
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, pts TEXT, created_ts REAL, expires_ts REAL, "
                 "closed_ts REAL, source TEXT, note TEXT, ref TEXT)")
             con.commit()
+        try:
+            os.chmod(DB_PATH, 0o600)      # el historial de alertas es privado
+        except OSError:
+            pass
         return True
     except (sqlite3.Error, OSError):
         return False
@@ -722,8 +1022,25 @@ def db_incident_open(kind, ref, now, lat, lon, msg, severity):
         _db_run("UPDATE incidentes SET last_ts=?, msg=?, lat=?, lon=? WHERE id=?",
                 (now, msg, lat, lon, int(open_["id"].iloc[0])))
     else:
-        _db_run("INSERT INTO incidentes (kind, ref, first_ts, last_ts, resolved_ts, lat, lon, msg, severity, confirmed) "
-                "VALUES (?,?,?,?,NULL,?,?,?,?,0)", (kind, ref, now, now, lat, lon, msg, severity))
+        recent = _db_query("SELECT id FROM incidentes WHERE kind=? AND ref=? AND resolved_ts IS NOT NULL AND resolved_ts >= ? "
+                           "AND confirmed != -1 ORDER BY resolved_ts DESC LIMIT 1", (kind, ref, now - 600))
+        if len(recent):    # el aviso "rebotó" en menos de 10 min: es el mismo incidente, no uno nuevo
+            _db_run("UPDATE incidentes SET resolved_ts=NULL, last_ts=?, msg=?, lat=?, lon=? WHERE id=?",
+                    (now, msg, lat, lon, int(recent["id"].iloc[0])))
+        else:
+            _db_run("INSERT INTO incidentes (kind, ref, first_ts, last_ts, resolved_ts, lat, lon, msg, severity, confirmed) "
+                    "VALUES (?,?,?,?,NULL,?,?,?,?,0)", (kind, ref, now, now, lat, lon, msg, severity))
+
+
+def db_clear_incidents():
+    _db_run("DELETE FROM incidentes")
+    _db_run("DELETE FROM eventos")
+
+
+def db_event_counts(hours=24):
+    df = _db_query("SELECT nivel, clave, COUNT(*) AS n FROM eventos WHERE ts >= ? AND fase='nuevo' "
+                   "GROUP BY nivel, clave ORDER BY n DESC LIMIT 500", (time.time() - hours * 3600,))
+    return df if not df.empty else pd.DataFrame(columns=["nivel", "clave", "n"])
 
 
 def db_incident_close(kind, ref, now):
@@ -750,7 +1067,7 @@ def db_incidents(days=RETENTION_DAYS):
 def db_cut_add(name, pts, source, note, expires_ts, ref=""):
     return _db_run("INSERT INTO tramos (name, pts, created_ts, expires_ts, closed_ts, source, note, ref) "
                    "VALUES (?,?,?,?,NULL,?,?,?)",
-                   (name, json.dumps([[a, b] for a, b in pts]), time.time(), expires_ts, source, note, ref))
+                   (str(name)[:200], json.dumps([[a, b] for a, b in pts[:500]]), time.time(), expires_ts, source, str(note)[:500], ref))
 
 
 def db_cut_close(cut_id, now):
@@ -859,6 +1176,9 @@ class TrainTracker:
             except (TypeError, ValueError):
                 cod_key = cod_p
 
+            tm0 = to_float(t.get("time"))
+            if tm0 is not None and tm0 > 1e11:
+                tm0 /= 1000.0
             prev = prev_state.get(t_id)
             speed, inst, state_speed = 0.0, None, None
             heading, has_heading, slow_since = 0.0, False, None
@@ -866,12 +1186,16 @@ class TrainTracker:
 
             if prev:
                 heading, has_heading = prev["heading"], prev["has_heading"]
-                dt = fetched_at - prev["ts"]
+                gps_dt = (tm0 - prev["gps_t"]) if (tm0 is not None and prev.get("gps_t") is not None) else None
+                dt = gps_dt if gps_dt is not None else fetched_at - prev["ts"]   # dt real entre muestras GPS
+                if gps_dt is not None and gps_dt <= 0 and not t_id.startswith("SIM-"):
+                    compared += 1                      # sin muestra nueva: cuenta para detectar feed congelado
                 if dt >= 1:
                     dist = haversine(prev["lat"], prev["lon"], lat, lon)
-                    compared += 1
-                    if dist > 1:
-                        moved += 1
+                    if not t_id.startswith("SIM-"):
+                        compared += 1
+                        if dist > 1:
+                            moved += 1
                     inst_raw = (dist / dt) * 3.6
                     if dt > MAX_GAP_S:
                         if dist > MIN_MOVE_M:
@@ -903,7 +1227,8 @@ class TrainTracker:
                 dist_to_station = nearest_station_m(lat, lon, stations_arr)
 
             new_state[t_id] = {"lat": lat, "lon": lon, "ts": fetched_at, "speed": state_speed, "inst": inst,
-                               "heading": heading, "has_heading": has_heading, "slow_since": slow_since}
+                               "heading": heading, "has_heading": has_heading, "slow_since": slow_since,
+                               "gps_t": tm0 if tm0 is not None else (prev or {}).get("gps_t")}
 
             retraso = to_float(t.get("ultRetraso"))
             retraso = int(retraso) if retraso is not None else 0
@@ -918,7 +1243,8 @@ class TrainTracker:
 
             rows.append({
                 "cod_comercial": t_id, "tipo": NOM_PROD.get(cod_key, f"Cód. {cod_p}"),
-                "grupo": grupo_de(cod_key), "cod_prod": cod_key,
+                "grupo": grupo_de(cod_key), "cod_prod": cod_key, "src": t.get("_src", "LD"),
+                "status": t.get("_status", ""), "delay_known": bool(t.get("_delay_known", True)),
                 "lat": lat, "lon": lon, "retraso_min": retraso, "speed_kmh": round(speed, 1),
                 "inst_kmh": round(inst, 1) if inst is not None else 0.0,
                 "prev_inst_kmh": round(prev_inst, 1) if prev_inst is not None else 0.0,
@@ -936,6 +1262,11 @@ class TrainTracker:
             self.duplicate_polls += 1
             ref = self.last_change_ts if self.last_change_ts is not None else fetched_at
             self.frozen = (fetched_at - ref) > FROZEN_AFTER_S
+            sim_rows = [r for r in rows if str(r["cod_comercial"]).startswith("SIM-")]
+            if sim_rows:      # el tren de prueba sigue su propio ritmo aunque el feed real no cambie
+                keep = self.last_df[~self.last_df["cod_comercial"].astype(str).str.startswith("SIM-")]
+                self.last_df = pd.concat([keep, pd.DataFrame(sim_rows, columns=BASE_COLUMNS)], ignore_index=True)
+                self.state.update({k: v for k, v in new_state.items() if k.startswith("SIM-")})
             return self.last_df
 
         self.state = new_state
@@ -965,13 +1296,17 @@ def apply_stop_rules(df, cfg, brake_memory=None, now=None):
     dist = pd.to_numeric(df["dist_to_station"], errors="coerce")
     age = pd.to_numeric(df["gps_age_s"], errors="coerce")
     fresh = ~(age > cfg.get("gps_stale_s", 600))   # sin dato de edad => se considera fresco
-    far = dist.notna() & (dist > cfg["station_radius_m"]) & fresh
+    known = cfg.get("stations_known", True)   # sin estaciones cargadas NO se puede descartar "en estación": se alarma
+    far = (dist.notna() & (dist > cfg["station_radius_m"]) & fresh) if known else fresh
+    far = far & ~df["status"].fillna("").isin(["STOPPED_AT", "INCOMING_AT"])   # Cercanías: "en estación" según el feed
+    far = far & ~((df["est_ant"].astype(str) != "") & (df["est_ant"] == df["est_sig"]))  # larga distancia: "En <estación>"
     sf = df["stopped_for_s"]
-    df["is_stopped"] = ((sf >= cfg["min_stop_s"]) & far).astype(bool)
-    df["is_suspect"] = ((sf >= cfg["early_stop_s"]) & (sf < cfg["min_stop_s"]) & far).astype(bool)
+    mult = df["src"].map({"CERC": cfg.get("cerc_stop_mult", 3)}).fillna(1.0)    # Cercanías: más prudencia
+    df["is_stopped"] = ((sf >= cfg["min_stop_s"] * mult) & far).astype(bool)
+    df["is_suspect"] = ((sf >= cfg["early_stop_s"] * mult) & (sf < cfg["min_stop_s"] * mult) & far).astype(bool)
 
     cand = ((df["prev_inst_kmh"] >= cfg["brake_min_kmh"]) & (df["decel_ms2"] >= cfg["brake_ms2"])
-            & dist.notna() & (dist > cfg["brake_station_m"]) & fresh)
+            & ((dist.notna() & (dist > cfg["brake_station_m"])) if known else True) & fresh & (df["src"] == "LD"))
     if brake_memory is not None and now is not None:
         for cod in df.loc[cand, "cod_comercial"]:
             brake_memory[cod] = now + cfg["brake_hold_s"]
@@ -993,7 +1328,8 @@ def check_proximity_risk(df, cfg):
         target_mask = target_mask | (df["is_suspect"] == True)  # noqa: E712
     stopped = df[target_mask]
     moving = df[(df["is_stopped"] == False) & (df["is_suspect"] == False)  # noqa: E712
-                & (df["speed_kmh"] > max(1, cfg["risk_min_kmh"])) & (df["has_heading"] == True)]  # noqa: E712
+                & (df["speed_kmh"] > max(1, cfg["risk_min_kmh"])) & (df["has_heading"] == True)  # noqa: E712
+                & (df["src"] == "LD")]
     if stopped.empty or moving.empty:
         return alerts
 
@@ -1032,7 +1368,7 @@ def segment_for_train(row, info, half_m):
 def detect_accidents(df, risk_alerts, cfg, dismissed=()):
     """Posible accidente: tren detenido lejos de estación Y (frenada brusca previa, o tiempo largo, o riesgo de alcance)."""
     out = []
-    if df.empty:
+    if df.empty or not cfg.get("stations_known", True):   # sin estaciones fiables NO se declara ningún accidente
         return out
     targets = {a["stopped"] for a in risk_alerts}
     for _, s in df[df["is_stopped"] == True].iterrows():  # noqa: E712
@@ -1042,7 +1378,8 @@ def detect_accidents(df, risk_alerts, cfg, dismissed=()):
         why = []
         if bool(s["braking"]):
             why.append("frenada brusca previa")
-        if s["stopped_for_s"] >= cfg.get("accident_s", 240):
+        limit = cfg.get("accident_s", 600) * (cfg.get("cerc_stop_mult", 3) if str(s["src"]) == "CERC" else 1)
+        if s["stopped_for_s"] >= limit:
             why.append(f"{int(s['stopped_for_s'])} s detenido lejos de estación")
         if cod in targets:
             why.append("otro tren se aproxima")
@@ -1057,7 +1394,7 @@ def check_cut_risk(df, cuts, cfg):
     if df.empty or not cuts:
         return alerts
     moving = df[(df["is_stopped"] == False) & (df["speed_kmh"] > max(1, cfg["risk_min_kmh"]))  # noqa: E712
-                & (df["has_heading"] == True)]  # noqa: E712
+                & (df["has_heading"] == True) & (df["src"] == "LD")]  # noqa: E712
     for _, m in moving.iterrows():
         for c in cuts:
             pt, d = path_nearest(m["lat"], m["lon"], c["pts"])
@@ -1077,7 +1414,53 @@ def check_cut_risk(df, cuts, cfg):
     return alerts
 
 
-def compute_risk(df, risk_alerts, cut_alerts, acc, cfg):
+def check_close_following(df, cfg):
+    """
+    Seguidor que se acerca por detrás a un tren MÁS LENTO que va delante (mismo sentido y casi misma línea).
+    Avisa por tiempo hasta alcance y por distancia de frenado: aunque el de delante no esté parado (p. ej. a 33 km/h).
+    Heurística: sin la topología real de la vía (desvíos, vías paralelas) puede dar falsos avisos.
+    """
+    out = []
+    if df.empty or not cfg.get("close_on", True):
+        return out
+    age = pd.to_numeric(df["gps_age_s"], errors="coerce")
+    ok = df[(df["has_heading"] == True) & (df["speed_kmh"] > SLOW_KMH) & ~(age > cfg.get("gps_stale_s", 600))  # noqa: E712
+            & (df["src"] == "LD")]
+    if len(ok) < 2:
+        return out
+    lat, lon = ok["lat"].to_numpy(float), ok["lon"].to_numpy(float)
+    hd, sp = ok["heading"].to_numpy(float), ok["speed_kmh"].to_numpy(float)
+    cod, tipo = ok["cod_comercial"].tolist(), ok["tipo"].tolist()
+    kx = math.cos(math.radians(float(lat.mean())))
+    x, y = (lon - lon.mean()) * kx * 111320.0, (lat - lat.mean()) * 110540.0
+    a_srv = max(0.1, float(cfg.get("close_decel", 0.6)))
+    for i in range(len(ok)):                       # i = seguidor
+        dx, dy = x - x[i], y - y[i]
+        d = np.hypot(dx, dy)
+        brg = (np.degrees(np.arctan2(dx, dy)) + 360.0) % 360.0
+        da = np.abs((brg - hd[i] + 180.0) % 360.0 - 180.0)        # ¿está delante del seguidor?
+        dh = np.abs((hd - hd[i] + 180.0) % 360.0 - 180.0)         # ¿mismo sentido?
+        cross = d * np.sin(np.radians(da))                        # desvío lateral
+        m = ((d > 20) & (d < cfg["close_gap_m"]) & (da < 45) & (dh < cfg["close_heading_deg"])
+             & (cross <= cfg["close_lateral_m"]) & (sp[i] - sp > cfg["close_closing_kmh"]))
+        m[i] = False
+        if not m.any():
+            continue
+        j = int(np.where(m)[0][np.argmin(d[m])])                  # el tren de delante más cercano
+        vf, vl = sp[i] / 3.6, sp[j] / 3.6
+        gap, closing = float(d[j]), vf - vl
+        ttc = gap / closing
+        brake = max(0.0, vf * vf - vl * vl) / (2 * a_srv)          # distancia necesaria para igualar su velocidad
+        if ttc <= cfg["close_ttc_s"] or gap <= brake * 1.5:
+            out.append({"follower": cod[i], "leader": cod[j], "tipo": tipo[i], "gap_m": round(gap),
+                        "v_f": round(float(sp[i])), "v_l": round(float(sp[j])), "closing_kmh": round(closing * 3.6),
+                        "ttc_s": round(ttc), "brake_m": round(brake), "critical": bool(gap <= brake or ttc <= 60),
+                        "lat": float(lat[j]), "lon": float(lon[j])})
+    out.sort(key=lambda a: a["ttc_s"])
+    return out
+
+
+def compute_risk(df, risk_alerts, cut_alerts, acc, cfg, close=()):
     """Índice de riesgo 0-100 por tren y motivos."""
     out = {}
     if df.empty:
@@ -1108,6 +1491,10 @@ def compute_risk(df, risk_alerts, cut_alerts, acc, cfg):
     for a in cut_alerts:
         urg = max(0.0, 1 - a["ttc_s"] / max(1, cfg["risk_ttc_s"] * 2))
         bump(a["moving"], int(45 + 25 * urg), "TRAMO CORTADO")
+    for a in close:
+        urg = max(0.0, 1 - a["ttc_s"] / max(1, cfg.get("close_ttc_s", 150)))
+        bump(a["follower"], int((65 if a["critical"] else 40) + 25 * urg), "APROXIMACIÓN")
+        bump(a["leader"], 10, "TIENE TREN DETRÁS")
     for a in acc:
         bump(a["cod"], 30, "ACCIDENTE")
     return out
@@ -1127,7 +1514,12 @@ def analyze(df, cfg, cuts, dismissed=()):
     risk = check_proximity_risk(df, cfg)
     acc = detect_accidents(df, risk, cfg, dismissed)
     cut = check_cut_risk(df, cuts, cfg)
-    return {"risk": risk, "acc": acc, "cut": cut, "scores": compute_risk(df, risk, cut, acc, cfg)}
+    close = check_close_following(df, cfg)
+    overflow = 0
+    if len(acc) > cfg.get("accident_max", 2):      # 3+ accidentes a la vez no es plausible: es un fallo de datos/calibración
+        overflow, acc = len(acc), []
+    return {"risk": risk, "acc": acc, "cut": cut, "close": close, "acc_overflow": overflow,
+            "scores": compute_risk(df, risk, cut, acc, cfg, close)}
 
 
 def make_event(kind, key, msg, speak=None, lat=None, lon=None, subject=None):
@@ -1136,50 +1528,92 @@ def make_event(kind, key, msg, speak=None, lat=None, lon=None, subject=None):
             "lon": float(lon) if lon is not None else None, "subject": subject or msg}
 
 
-def build_events(df, risk_alerts, cut_alerts=(), accidents=(), info=None):
+def _brief(s, info):
+    """(ruta, dónde) legibles de una fila de tren."""
+    info = info or {}
+    ruta = (f"{label_est(s['origen'], info)} → {label_est(s['destino'], info)}"
+            if (s["origen"] or s["destino"]) else "ruta desconocida")
+    w = where_text(s["est_ant"], s["est_sig"], info)
+    where = (w[0].lower() + w[1:]) if w else "tramo desconocido"
+    return ruta, where
+
+
+def _dist_txt(s):
+    d = to_float(s["dist_to_station"])
+    return f"a {int(round(d))} m de la estación más cercana" if d is not None else \
+        "sin dato de estaciones (no se puede descartar que esté en una estación)"
+
+
+def build_events(df, risk_alerts, cut_alerts=(), accidents=(), info=None, close_alerts=(), acc_overflow=0):
     events = []
+    info = info or {}
+    if acc_overflow:
+        events.append(make_event(
+            "system", "sys|plaus",
+            f"{acc_overflow} candidatos a accidente a la vez: se DESCARTAN por plausibilidad (más de lo razonable). Probable "
+            "fallo de datos o calibración demasiado sensible: revisa estaciones y parámetros en CALIBRAR.",
+            speak="Demasiados candidatos a accidente a la vez, descartados por plausibilidad", subject="Plausibilidad de accidentes"))
     if df.empty:
         return events
     for _, s in df[df["is_stopped"] == True].iterrows():  # noqa: E712
         cod = s["cod_comercial"]
+        ruta, where = _brief(s, info)
         events.append(make_event(
             "stopped", f"stopped|{cod}",
-            f"Tren {cod} ({s['tipo']}) detenido en vía a {fmt_m(s['dist_to_station'])} m de la estación más cercana, "
-            f"{int(s['stopped_for_s'])} s a baja velocidad (retraso {int(s['retraso_min'])} min).",
-            speak=f"Tren {cod} detenido en vía", lat=s["lat"], lon=s["lon"], subject=f"Tren {cod} detenido en vía"))
+            f"DETENIDO EN VÍA · Tren {cod} ({s['tipo']}, {ruta}) · {where} · parado {mmss(s['stopped_for_s'])} a "
+            f"{s['speed_kmh']:.0f} km/h · {_dist_txt(s)} · retraso {int(s['retraso_min'])} min · "
+            f"posición {s['lat']:.4f}, {s['lon']:.4f}.",
+            speak=f"Tren {cod} detenido en vía, {where}", lat=s["lat"], lon=s["lon"], subject=f"Tren {cod} detenido en vía"))
     for _, s in df[df["is_suspect"] == True].iterrows():  # noqa: E712
         cod = s["cod_comercial"]
+        ruta, where = _brief(s, info)
         events.append(make_event(
             "early", f"early|{cod}",
-            f"Posible detención: tren {cod} ({s['tipo']}) lleva {int(s['stopped_for_s'])} s a baja velocidad, "
-            f"a {fmt_m(s['dist_to_station'])} m de la estación más cercana.",
+            f"AVISO TEMPRANO · Tren {cod} ({s['tipo']}, {ruta}) · {where} · {mmss(s['stopped_for_s'])} a baja velocidad "
+            f"({s['speed_kmh']:.0f} km/h) · {_dist_txt(s)} · retraso {int(s['retraso_min'])} min.",
             speak=f"Aviso temprano. Tren {cod} posiblemente detenido", lat=s["lat"], lon=s["lon"],
             subject=f"Tren {cod} posible detención"))
     for _, s in df[df["braking"] == True].iterrows():  # noqa: E712
         cod = s["cod_comercial"]
+        ruta, where = _brief(s, info)
         events.append(make_event(
             "brake", f"brake|{cod}",
-            f"Frenada brusca (heurística): tren {cod} ({s['tipo']}) bajó de {s['prev_inst_kmh']:.0f} a "
-            f"{s['inst_kmh']:.0f} km/h ({s['decel_ms2']:.2f} m/s²) lejos de estaciones.",
+            f"FRENADA BRUSCA · Tren {cod} ({s['tipo']}, {ruta}) · {where} · de {s['prev_inst_kmh']:.0f} a "
+            f"{s['inst_kmh']:.0f} km/h ({s['decel_ms2']:.2f} m/s²) · {_dist_txt(s)}.",
             speak=f"Frenada brusca del tren {cod}", lat=s["lat"], lon=s["lon"], subject=f"Tren {cod} frenada brusca"))
+    for a in close_alerts:
+        crit = a["critical"]
+        events.append(make_event(
+            "risk" if crit else "close", f"{'closecrit' if crit else 'close'}|{a['follower']}|{a['leader']}",
+            f"{'NO LLEGA A FRENAR' if crit else 'APROXIMACIÓN'} · Tren {a['follower']} ({a['tipo']}, {a['v_f']} km/h) se acerca "
+            f"por detrás al tren {a['leader']} ({a['v_l']} km/h): hueco {a['gap_m']} m, cierre {a['closing_kmh']} km/h, "
+            f"alcance en {a['ttc_s']} s; necesita {a['brake_m']} m para igualar su velocidad.",
+            speak=f"{'Peligro. ' if crit else 'Atención. '}Tren {a['follower']} se aproxima al tren {a['leader']}. "
+                  f"{a['ttc_s']} segundos.",
+            lat=a["lat"], lon=a["lon"], subject=f"Tren {a['follower']} aproximándose a {a['leader']}"))
     for a in risk_alerts:
         events.append(make_event(
             "risk", f"risk|{a['moving']}|{a['stopped']}",
-            f"Tren {a['moving']} ({a['speed_kmh']} km/h) se acerca al tren {a['stopped']} detenido: "
+            f"RIESGO CRÍTICO · Tren {a['moving']} ({a['speed_kmh']} km/h) se acerca al tren {a['stopped']} detenido: "
             f"{a['dist_m']} m, TTC {a['ttc_s']} s.",
             speak=f"Riesgo crítico. Tren {a['moving']} se acerca al tren {a['stopped']} detenido. {a['ttc_s']} segundos.",
             lat=a["lat"], lon=a["lon"], subject=f"Riesgo {a['moving']} hacia {a['stopped']}"))
     for a in cut_alerts:
         events.append(make_event(
             "risk", f"cutrisk|{a['moving']}|{a['cut_id']}",
-            f"Tren {a['moving']} ({a['speed_kmh']} km/h) se dirige al tramo cortado «{a['cut_name']}»: "
+            f"TRAMO CORTADO · Tren {a['moving']} ({a['speed_kmh']} km/h) se dirige al tramo «{a['cut_name']}»: "
             f"{a['dist_m']} m, TTC {a['ttc_s']} s.",
             speak=f"Atención. Tren {a['moving']} se dirige a un tramo cortado. {a['ttc_s']} segundos.",
             lat=a["lat"], lon=a["lon"], subject=f"Tren {a['moving']} hacia tramo cortado"))
     for a in accidents:
+        row = df[df["cod_comercial"] == a["cod"]]
+        extra = ""
+        if not row.empty:
+            ruta, where = _brief(row.iloc[0], info)
+            extra = f" ({ruta}, {where}, {a['lat']:.4f}, {a['lon']:.4f})"
         events.append(make_event(
             "accident", f"accident|{a['cod']}",
-            f"POSIBLE ACCIDENTE: tren {a['cod']} ({a['tipo']}) detenido en vía — {', '.join(a['why'])}.",
+            f"POSIBLE ACCIDENTE · Tren {a['cod']} ({a['tipo']}){extra} detenido en vía — {', '.join(a['why'])}.",
             speak=f"Posible accidente. Tren {a['cod']} detenido en vía", lat=a["lat"], lon=a["lon"],
             subject=f"Posible accidente del tren {a['cod']}"))
     return events
@@ -1237,8 +1671,8 @@ def send_telegram(token, chat, text, lat=None, lon=None):
             pass
 
 
-NTFY_PRIORITY = {"accident": 5, "risk": 5, "stopped": 4, "brake": 3, "early": 3, "system": 2, "resolved": 2}
-NTFY_TAGS = {"accident": "boom,rotating_light,train", "risk": "rotating_light,train", "stopped": "red_circle,train", "brake": "warning,train",
+NTFY_PRIORITY = {"close": 4, "accident": 5, "risk": 5, "stopped": 4, "brake": 3, "early": 3, "system": 2, "resolved": 2}
+NTFY_TAGS = {"close": "zap,train", "accident": "boom,rotating_light,train", "risk": "rotating_light,train", "stopped": "red_circle,train", "brake": "warning,train",
              "early": "warning,train", "system": "gear", "resolved": "white_check_mark"}
 
 
@@ -1295,6 +1729,40 @@ def should_push(ev, cfg):
 # ==========================================
 # 7. Monitor en segundo plano (funciona sin ninguna pestaña abierta)
 # ==========================================
+def _claim_instance():
+    """Evita que DOS copias del programa envíen avisos duplicados. Devuelve el PID de la otra copia viva (o None)."""
+    path = os.getenv("EBM_LOCK", "ebm_monitor.pid")
+    me = os.getpid()
+    try:
+        if os.name == "posix" and os.path.exists(path):
+            with open(path) as f:
+                old = int((f.read() or "0").strip() or 0)
+            if old and old != me:
+                try:
+                    os.kill(old, 0)
+                    return old
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    return old
+                except OSError:
+                    pass
+        with open(path, "w") as f:
+            f.write(str(me))
+
+        def _release():
+            try:
+                with open(path) as f:
+                    if (f.read() or "").strip() == str(me):
+                        os.remove(path)
+            except OSError:
+                pass
+        atexit.register(_release)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def _where(exc):
     """Archivo:línea donde ocurrió una excepción (para diagnóstico en pantalla)."""
     tb = exc.__traceback__
@@ -1307,15 +1775,29 @@ def diagnose_connection():
     """Prueba directa de las dos fuentes de datos. Devuelve [(nombre, ok, detalle)]."""
     out = []
     for name, url, params in (("Feed de trenes", URL_FLOTA, {"v": int(time.time() * 1000)}),
-                              ("Estaciones", URL_ESTACIONES, None), ("Rutas y horarios", URL_RUTAS, None)):
+                              ("Estaciones CSV Renfe", RENFE_STATIONS_CSV_URLS[0], None), ("Estaciones", URL_ESTACIONES, None),
+                              ("Rutas y horarios", URL_RUTAS, None),
+                              ("Cercanías (posiciones)", URL_CERC_POS, None), ("Cercanías (retrasos)", URL_CERC_TRIPS, None),
+                              ("Avisos oficiales", URL_CERC_ALERTS, None)):
         t0 = time.time()
         try:
-            r = requests.get(url, params=params, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            r = requests.get(url, params=params, timeout=10, headers={"User-Agent": "Mozilla/5.0"}, stream=True)
             ms = int((time.time() - t0) * 1000)
             if r.status_code != 200:
                 out.append((name, False, f"HTTP {r.status_code} en {ms} ms"))
                 continue
-            data = r.json()
+            body = read_capped(r)
+            if name.startswith("Estaciones CSV"):
+                txt = decode_text(body)
+                est = parse_stations_csv(txt)
+                out.append((name, bool(est), f"HTTP 200 en {ms} ms · {len(body)} bytes · {len(est)} estaciones leídas · "
+                                             f"inicio del archivo: {txt[:110]!r}"))
+                continue
+            data = json.loads(body)
+            if name.startswith(("Cercanías", "Avisos")):
+                n = len(data.get("entity", []) or []) if isinstance(data, dict) else 0
+                out.append((name, n > 0, f"HTTP 200 en {ms} ms · {n} entidades"))
+                continue
             if name.startswith("Rutas"):
                 rt = parse_routes(data)
                 out.append((name, bool(rt), f"HTTP 200 en {ms} ms · {len(rt)} trenes con paradas reconocidas · "
@@ -1330,8 +1812,15 @@ def diagnose_connection():
     return out
 
 
-INCIDENT_KINDS = ("brake", "stopped", "risk", "accident")
-SEVERITY = {"brake": 1, "stopped": 2, "risk": 3, "accident": 4}
+INCIDENT_KINDS = ("brake", "stopped", "risk", "accident", "close")
+SEVERITY = {"brake": 1, "stopped": 2, "close": 2, "risk": 3, "accident": 4}
+SIM_ID = "SIM-001"
+
+
+def _is_sim(ev):
+    """Eventos del tren de simulacro: nunca se envían a canales ni se guardan en la memoria de 30 días."""
+    k = ev.get("key", "")
+    return "SIM-" in k or k.endswith("|sim_cut")
 
 
 class Monitor:
@@ -1352,7 +1841,23 @@ class Monitor:
         self.stations_arr = np.empty((0, 2))
         self.stations_ts = 0.0
         self.stations_try_ts = 0.0
+        self.cerc_cache, self.cerc_ts, self.cerc_ok_ts, self.cerc_error = None, 0.0, 0.0, None
+        self.trips, self.trips_error = {}, None
+        self.alerts, self.alerts_error, self.alerts_ts = [], None, 0.0
         self.stations_error = None
+        self.stations_source = None
+        self._stations_busy = False
+        self.sim = {"active": False, "lat": 38.30, "lon": -4.20, "heading": 0.0, "speed": 0.0, "target": 0.0,
+                    "decel": 0.8, "delay": 0, "ts": None, "trail": []}
+        self.sim_cut = None
+        self.no_autocut = set()          # accidentes cuyo tramo el usuario ya reabrió
+        self.stations_base = []          # descargadas (Renfe CSV / GTFS / OSM / caché / lista básica)
+        self.learned = {}                # código -> (lat, lon) aprendidas del propio feed (tren "EN estación")
+        self._learned_saved = 0
+        self.push_times = deque()
+        self.push_suppressed, self.push_sum_ts = 0, 0.0
+        self.push_enabled, self.user_stopped = True, False
+        self.secondary, self.primary_pid = False, None
         self.routes = {}
         self.routes_dbg = None
         self.routes_error = None
@@ -1385,6 +1890,9 @@ class Monitor:
         self.wake = threading.Event()
         self.db_ok = False if demo else db_init()   # la demo no toca la base de datos real
         self.cuts = db_cuts() if self.db_ok else []
+        if not demo:
+            self.primary_pid = _claim_instance()
+            self.secondary = bool(self.primary_pid)
 
     # ---- ciclo de vida ----
     def start(self):
@@ -1396,12 +1904,52 @@ class Monitor:
             self.thread.start()
 
     def ensure_running(self):
+        if self.user_stopped:
+            return
         if self.thread is None or not self.thread.is_alive():
             self.start()
 
     def stop(self):
         self.stop_flag.set()
         self.wake.set()
+
+    def stop_user(self):
+        """El usuario detiene el monitor: no se sondea ni se envía NADA hasta que lo reanude."""
+        self.user_stopped = True
+        self.stop()
+
+    def resume_user(self):
+        self.user_stopped = False
+        self.stop_flag.clear()
+        self.start()
+
+    def set_push(self, on):
+        self.push_enabled = bool(on)
+
+    def _can_push(self, e):
+        """Envío externo permitido: canales, interruptor, instancia principal, no demo/simulacro y límite anti-saturación."""
+        if not (self.channels and self.push_enabled and not self.secondary and not self.demo and not _is_sim(e)):
+            return False
+        if not should_push(e, self.cfg):
+            return False
+        now = time.time()
+        while self.push_times and now - self.push_times[0] > 300:
+            self.push_times.popleft()
+        if len(self.push_times) >= (15 if e["kind"] in ("accident", "risk") else 6):
+            self.push_suppressed += 1
+            return False
+        self.push_times.append(now)
+        return True
+
+    def _flood_summary(self):
+        now = time.time()
+        if (self.push_suppressed and now - self.push_sum_ts > 300 and self.channels and self.push_enabled
+                and not self.secondary and not self.demo):
+            ev = make_event("system", "sys|flood", f"{self.push_suppressed} avisos más NO se enviaron "
+                                                   "(límite anti-saturación: máx. 6 cada 5 min).")
+            ev.update(seq=0, ts=now, hora=datetime.now(TZ).strftime("%H:%M:%S"), phase="resumen")
+            self.push_suppressed, self.push_sum_ts = 0, now
+            self.pool.submit(self._deliver, ev)
 
     def poll_now(self):
         self.wake.set()
@@ -1429,8 +1977,14 @@ class Monitor:
     def update_channels(self, values):
         with self.lock:
             for k, v in values.items():
-                if v and str(v).strip():
-                    self.channels[k] = str(v).strip()
+                if not (v and str(v).strip()):
+                    continue
+                v = str(v).strip()
+                if k in ("adif_url", "webhook_url", "ntfy_server") and not valid_http_url(v):
+                    continue
+                if k == "ntfy_topic" and not valid_topic(v):
+                    continue
+                self.channels[k] = v
 
     def channel_names(self):
         with self.lock:
@@ -1446,11 +2000,39 @@ class Monitor:
 
     def set_stations(self, stations):
         with self.lock:
-            self.stations = list(stations)
-            self.station_info = {s["code"]: s for s in self.stations if s.get("code")}
-            self.stations_arr = np.array([[s["lat"], s["lon"]] for s in self.stations], dtype=float) \
-                if self.stations else np.empty((0, 2))
+            self.stations_base = list(stations)
+            self._rebuild_stations()
             self.stations_ts = time.time()
+
+    def _rebuild_stations(self):
+        base_codes = {x.get("code") for x in self.stations_base if x.get("code")}
+        learned = [{"code": c, "n": "", "prov": "", "lat": la, "lon": lo, "learned": True}
+                   for c, (la, lo) in self.learned.items() if c not in base_codes]
+        self.stations = list(self.stations_base) + learned
+        info = {x["code"]: x for x in learned}
+        info.update({x["code"]: x for x in self.stations_base if x.get("code")})
+        self.station_info = info
+        self.stations_arr = np.array([[x["lat"], x["lon"]] for x in self.stations], dtype=float) \
+            if self.stations else np.empty((0, 2))
+
+    def _learn_stations(self, df):
+        """Aprende coordenadas de estaciones del propio feed: tren 'EN estación' (larga distancia) o STOPPED/INCOMING (Cercanías)."""
+        if df.empty:
+            return
+        same = (df["est_ant"].astype(str) != "") & (df["est_ant"] == df["est_sig"])
+        at = df[(same & (df["speed_kmh"] < 40)) | df["status"].isin(["STOPPED_AT", "INCOMING_AT"])]
+        base_codes = {x.get("code") for x in self.stations_base}
+        new = 0
+        for _, r in at.iterrows():
+            code = r["est_sig"] or r["est_ant"]
+            if code and code not in self.learned and code not in base_codes:
+                self.learned[code] = (float(r["lat"]), float(r["lon"]))
+                new += 1
+        if new:
+            self._rebuild_stations()
+            if len(self.learned) - self._learned_saved >= 20:
+                self._learned_saved = len(self.learned)
+                save_stations_cache(self.stations)
 
     def has_stations(self):
         return len(self.stations) > 0
@@ -1458,7 +2040,7 @@ class Monitor:
     # ---- tramos cortados ----
     def all_cuts(self):
         with self.lock:
-            return list(self.cuts) + list(self.adif_cuts)
+            return list(self.cuts) + list(self.adif_cuts) + ([self.sim_cut] if self.sim_cut else [])
 
     def reload_cuts(self):
         with self.lock:
@@ -1474,8 +2056,25 @@ class Monitor:
         return True
 
     def close_cut(self, cut_id):
-        db_cut_close(cut_id, time.time())
-        self.reload_cuts()
+        """Reabre un tramo. Si era automático (accidente activo) NO se vuelve a cortar solo hasta que el accidente termine."""
+        with self.lock:
+            cut = next((c for c in self.all_cuts() if str(c["id"]) == str(cut_id)), None)
+            kind, _, cod = str((cut or {}).get("ref") or "").partition("|")
+            if kind in ("auto", "acc") and cod:
+                self.no_autocut.add(cod)
+            if str(cut_id) == "sim_cut":
+                self.sim_cut = None
+                self.no_autocut.add(SIM_ID)
+                return True
+            if str(cut_id).startswith("demo"):
+                self.cuts = [c for c in self.cuts if str(c["id"]) != str(cut_id)]
+                return True
+            try:
+                db_cut_close(int(cut_id), time.time())
+            except (TypeError, ValueError):
+                return False
+            self.reload_cuts()
+            return True
 
     def _train_row(self, cod):
         df = self.tracker.last_df
@@ -1483,6 +2082,8 @@ class Monitor:
         return None if m.empty else m.iloc[0]
 
     def cut_from_train(self, cod):
+        if str(cod).startswith("SIM-"):
+            return None
         with self.lock:
             row = self._train_row(cod)
             if row is None:
@@ -1491,6 +2092,8 @@ class Monitor:
             return name if self.add_cut(name, pts, None, "Cierre manual desde el tren", "manual", f"man|{cod}") else None
 
     def confirm_accident(self, cod):
+        if str(cod).startswith("SIM-"):
+            return False
         """Confirma un accidente: queda registrado y su tramo pasa a cortado manual (hasta reabrirlo)."""
         with self.lock:
             row = self._train_row(cod)
@@ -1507,6 +2110,10 @@ class Monitor:
             return True
 
     def dismiss_accident(self, cod):
+        if str(cod).startswith("SIM-"):
+            with self.lock:
+                self.dismissed.add(cod)
+            return True
         """Falsa alarma: no se vuelve a levantar mientras el tren siga en esa situación."""
         with self.lock:
             now = time.time()
@@ -1521,9 +2128,192 @@ class Monitor:
 
     # ---- obtención de datos ----
     def _get_json(self, url, params=None):
-        r = self.http.get(url, params=params, timeout=10)
+        r = self.http.get(url, params=params, timeout=10, stream=True)
         r.raise_for_status()
-        return r.json()
+        return json.loads(read_capped(r))
+
+    # ---- estaciones ----
+    def _ensure_stations(self, now):
+        if self._stations_busy:
+            return
+        if self.stations_base and (now - self.stations_ts) <= 3600:
+            return
+        if (now - self.stations_try_ts) < 60:
+            return
+        self.stations_try_ts = now
+        if not self.stations_base:
+            cached = load_stations_cache()
+            if cached:
+                self.set_stations(cached)
+                self.stations_source = "copia guardada"
+        self._stations_busy = True
+        self.pool.submit(self._stations_job)
+
+    def _stations_job(self):
+        try:
+            errors, found, sources = [], [], []
+            steps = (("Renfe (CSV)", self._stations_csv), ("Renfe", self._stations_renfe),
+                     ("GTFS Renfe", self._stations_gtfs), ("OpenStreetMap", self._stations_osm))
+            for name, fetch in steps:
+                if len(found) >= 300:        # con 300+ estaciones ya hay cobertura suficiente
+                    break
+                try:
+                    est = fetch()
+                except Exception as e:  # noqa: BLE001 - un formato inesperado no puede matar el hilo de estaciones
+                    errors.append(f"{name}: {safe_error(e)}")
+                    continue
+                if est:
+                    found += est
+                    sources.append(name)
+                else:
+                    errors.append(f"{name}: sin estaciones")
+            if found:
+                uniq = {(x["code"], round(x["lat"], 4), round(x["lon"], 4)): x for x in found}
+                est = list(uniq.values())
+                self.set_stations(est)
+                save_stations_cache(est)
+                with self.lock:
+                    self.stations_error = " · ".join(errors) or None
+                    self.stations_source = " + ".join(sources)
+                print(f"[EBM] estaciones cargadas: {len(est)} ({' + '.join(sources)})" + (f" · avisos: {errors}" if errors else ""), flush=True)
+                return
+            print(f"[EBM] NO se pudieron descargar estaciones: {errors}", flush=True)
+            if not self.stations_base:     # nada descargado y sin copia: lista básica parcial para no ir a ciegas
+                self.set_stations(basic_stations())
+                with self.lock:
+                    self.stations_source = "lista básica PARCIAL integrada (principales estaciones)"
+            with self.lock:
+                self.stations_error = " · ".join(errors) + (" · usando copia guardada o lista básica" if self.stations else "")
+                if self.stations_base:
+                    self.stations_ts = time.time() - 3000   # reintentar en ~10 min
+        finally:
+            self._stations_busy = False
+
+    def _stations_csv(self):
+        last = None
+        for url in RENFE_STATIONS_CSV_URLS:
+            try:
+                r = self.http.get(url, timeout=60, stream=True)
+                r.raise_for_status()
+                est = parse_stations_csv(decode_text(read_capped(r)))
+                if est:
+                    return est
+            except requests.RequestException as e:
+                last = e
+        if last:
+            raise last
+        return []
+
+    def _stations_gtfs(self):
+        out, last = [], None
+        for url in GTFS_URLS:
+            try:
+                r = self.http.get(url, timeout=120, stream=True)
+                r.raise_for_status()
+                out += parse_gtfs_stops_zip(read_capped(r))
+            except (requests.RequestException, OSError, zipfile.BadZipFile) as e:
+                last = e
+        if not out and last:
+            raise last
+        return out
+
+    def _stations_renfe(self):
+        return parse_stations(self._get_json(URL_ESTACIONES))
+
+    def _stations_osm(self):
+        last = None
+        for url in OVERPASS_URLS:
+            try:
+                r = self.http.post(url, data={"data": OVERPASS_QUERY}, timeout=100, stream=True)
+                r.raise_for_status()
+                est = parse_overpass(json.loads(read_capped(r)))
+                if est:
+                    return est
+            except (requests.RequestException, ValueError) as e:
+                last = e
+        if last:
+            raise last
+        return []
+
+    # ---- red completa: Cercanías / Rodalies / Tram (GTFS-RT) ----
+    def _cerc_delays(self, now):
+        try:
+            self.trips = parse_gtfsrt_delays(self._get_json(URL_CERC_TRIPS))
+            self.trips_error = None
+        except (requests.RequestException, ValueError) as e:
+            self.trips_error = safe_error(e)
+        return self.trips
+
+    def _cercanias(self, now):
+        if self.demo:
+            return []
+        if self.cerc_cache is not None and (now - self.cerc_ts) < 20:
+            return self.cerc_cache
+        self.cerc_ts = now
+        try:
+            veh = parse_gtfsrt_vehicles(self._get_json(URL_CERC_POS))
+            delays = self._cerc_delays(now)
+            for t in veh:
+                d = delays.get(t["_trip"])
+                if d is not None:
+                    t["ultRetraso"], t["_delay_known"] = str(d), True
+            for n_x, url_x in enumerate(EXTRA_POS_URLS):      # FGC, Euskotren… si publican GTFS-RT en JSON
+                try:
+                    extra = parse_gtfsrt_vehicles(self._get_json(url_x))
+                    for t in extra:
+                        t["codComercial"] = f"X{n_x + 1}:{t['codComercial']}"
+                    veh += extra
+                except (requests.RequestException, ValueError):
+                    pass
+            self.cerc_cache, self.cerc_ok_ts, self.cerc_error = veh, now, None
+        except (requests.RequestException, ValueError) as e:
+            self.cerc_error = safe_error(e)
+            if self.cerc_cache is None or now - self.cerc_ok_ts > 120:
+                self.cerc_cache = []
+        return self.cerc_cache or []
+
+    def _poll_alerts(self, now):
+        if self.demo or (now - self.alerts_ts) < 120:
+            return
+        self.alerts_ts = now
+        try:
+            items = parse_gtfsrt_alerts(self._get_json(URL_CERC_ALERTS), now)
+            with self.lock:
+                self.alerts, self.alerts_error = items, None
+        except (requests.RequestException, ValueError) as e:
+            with self.lock:
+                self.alerts_error = safe_error(e)
+
+    # ---- simulacro (tren de prueba) ----
+    def sim_set(self, **kw):
+        with self.lock:
+            for k, v in kw.items():
+                if k in self.sim:
+                    self.sim[k] = v
+            if self.sim["active"] and self.sim["ts"] is None:
+                self.sim["ts"] = time.time()
+
+    def sim_remove(self):
+        with self.lock:
+            self.sim.update(active=False, ts=None, speed=0.0, target=0.0, trail=[])
+            self.sim_cut = None
+            self.dismissed.discard(SIM_ID)
+
+    def _sim_train(self, now):
+        s_ = self.sim
+        if not s_["active"]:
+            return None
+        dt = 0.0 if s_["ts"] is None else min(30.0, max(0.0, now - s_["ts"]))
+        s_["ts"] = now
+        if s_["speed"] < s_["target"]:
+            s_["speed"] = min(s_["target"], s_["speed"] + 0.6 * 3.6 * dt)
+        elif s_["speed"] > s_["target"]:
+            s_["speed"] = max(s_["target"], s_["speed"] - s_["decel"] * 3.6 * dt)
+        if dt > 0 and s_["speed"] > 0:
+            s_["lat"], s_["lon"] = offset_point(s_["lat"], s_["lon"], s_["heading"], s_["speed"] / 3.6 * dt)
+            s_["trail"] = (s_["trail"] + [(s_["lat"], s_["lon"])])[-80:]
+        return {"codComercial": SIM_ID, "codProduct": 99, "latitud": s_["lat"], "longitud": s_["lon"],
+                "ultRetraso": str(int(s_["delay"])), "time": int(now), "mat": "SIMULADO", "accesible": False}
 
     def tick(self):
         if not self._tick_lock.acquire(blocking=False):
@@ -1533,30 +2323,19 @@ class Monitor:
             if self.db_ok and now - self.last_purge > 6 * 3600:
                 self.last_purge = now
                 db_purge(now)
-            stale_stations = (now - self.stations_ts) > 3600
-            if (not self.stations or stale_stations) and (now - self.stations_try_ts) > 60:
-                self.stations_try_ts = now
-                try:
-                    stations = parse_stations(self._get_json(URL_ESTACIONES))
-                    if stations:
-                        self.set_stations(stations)
-                        self.stations_error = None
-                        save_stations_cache(stations)
-                    else:
-                        self.stations_error = "el archivo no contiene estaciones (formato distinto)"
-                except (requests.RequestException, ValueError) as e:
-                    self.stations_error = safe_error(e)
-                if not self.stations:
-                    cached = load_stations_cache()
-                    if cached:
-                        self.set_stations(cached)
-                        self.stations_error = (self.stations_error or "sin descarga") + " · usando copia guardada"
+            self._ensure_stations(now)
             try:
                 t0 = time.time()
                 raw = demo_feed(now) if self.demo else self._get_json(URL_FLOTA, {"v": int(now * 1000)})
                 self.latency_ms = int((time.time() - t0) * 1000)
                 if not (isinstance(raw, dict) and "trenes" in raw):
                     raise ValueError("feed sin 'trenes'")
+                try:
+                    cerc = self._cercanias(now)
+                except Exception as e:  # noqa: BLE001 - la red de Cercanías nunca debe impedir la lectura de larga distancia
+                    cerc, self.cerc_error = [], f"{type(e).__name__} al leer Cercanías"
+                if cerc:
+                    raw = dict(raw, trenes=list(raw.get("trenes") or []) + cerc)
             except (requests.RequestException, ValueError) as e:
                 with self.lock:
                     self.consecutive_errors += 1
@@ -1565,8 +2344,12 @@ class Monitor:
                     self._evaluate(time.time())
             else:
                 self.ingest(raw, time.time())
-            self._poll_incidents(time.time())
-            self._poll_routes(time.time())
+            for poll in (self._poll_incidents, self._poll_alerts, self._poll_routes):
+                try:
+                    poll(time.time())
+                except Exception as e:  # noqa: BLE001
+                    with self.lock:
+                        self.last_error_detail = f"{poll.__name__}: {type(e).__name__}"
         finally:
             self._tick_lock.release()
 
@@ -1603,6 +2386,9 @@ class Monitor:
 
     def ingest(self, raw, fetched_at):
         with self.lock:
+            sim_t = self._sim_train(fetched_at)
+            if sim_t is not None:
+                raw = dict(raw, trenes=list(raw.get("trenes") or []) + [sim_t])
             self.tracker.update(raw, self.stations_arr, fetched_at)
             self.consecutive_errors = 0
             self.last_error = None
@@ -1610,6 +2396,20 @@ class Monitor:
             self._evaluate(fetched_at)
 
     # ---- evaluación y avisos ----
+    def _sync_sim_cut(self, df, acc):
+        """Tramo cortado del simulacro: solo en memoria (no toca la base de datos real)."""
+        sim = [a for a in acc if str(a["cod"]).startswith("SIM-") and SIM_ID not in self.no_autocut]
+        before = self.sim_cut is not None
+        if sim:
+            row = df[df["cod_comercial"] == sim[0]["cod"]].iloc[0]
+            pts, name = segment_for_train(row, self.station_info, self.cfg["cut_half_km"] * 1000)
+            self.sim_cut = {"id": "sim_cut", "name": "SIMULACRO · " + name, "pts": pts, "source": "auto",
+                            "note": "Tramo del tren de prueba (no real)", "created_ts": time.time(),
+                            "expires_ts": None, "ref": "sim"}
+        else:
+            self.sim_cut = None
+        return before != (self.sim_cut is not None)
+
     def _sync_auto_cuts(self, df, acc, now):
         """Cada posible accidente corta automáticamente su tramo; se reabre solo cuando deja de detectarse."""
         refs = {f"auto|{a['cod']}" for a in acc}
@@ -1619,7 +2419,7 @@ class Monitor:
             before = len(self.cuts)  # demo: tramos automáticos solo en memoria
             have = {c.get("ref") for c in self.cuts}
             for a in acc:
-                if f"auto|{a['cod']}" not in have:
+                if f"auto|{a['cod']}" not in have and a["cod"] not in self.no_autocut:
                     row = df[df["cod_comercial"] == a["cod"]].iloc[0]
                     pts, name = segment_for_train(row, self.station_info, self.cfg["cut_half_km"] * 1000)
                     self.cuts.append({"id": f"demo{len(self.cuts) + 1}", "name": name, "pts": pts, "source": "auto",
@@ -1629,6 +2429,8 @@ class Monitor:
             return before != len(self.cuts) or bool(refs - have)
         changed = False
         for a in acc:
+            if a["cod"] in self.no_autocut:
+                continue
             row = df[df["cod_comercial"] == a["cod"]].iloc[0]
             pts, name = segment_for_train(row, self.station_info, self.cfg["cut_half_km"] * 1000)
             if db_cut_ensure_auto(f"auto|{a['cod']}", name, pts, "Cierre automático por posible accidente (aprox.)"):
@@ -1657,12 +2459,18 @@ class Monitor:
         hold = bool(sys_events)
         events = []
         if not hold and tr.has_data():
-            df = apply_stop_rules(tr.last_df, self.cfg, tr.brake_memory, tr.last_ts)
-            an = analyze(df, self.cfg, self.all_cuts(), self.dismissed)
+            self._learn_stations(tr.last_df)
+            cfg_eff = dict(self.cfg, stations_known=bool(self.stations))
+            df = apply_stop_rules(tr.last_df, cfg_eff, tr.brake_memory, tr.last_ts)
+            an = analyze(df, cfg_eff, self.all_cuts(), self.dismissed)
             self.dismissed &= set(df.loc[df["is_stopped"] == True, "cod_comercial"])  # noqa: E712
-            if self._sync_auto_cuts(df, an["acc"], now):
-                an = analyze(df, self.cfg, self.all_cuts(), self.dismissed)
-            events = build_events(df, an["risk"], an["cut"], an["acc"], self.station_info)
+            self.no_autocut &= {a["cod"] for a in an["acc"]}        # al terminar el accidente se "olvida" la reapertura
+            real_acc = [a for a in an["acc"] if not str(a["cod"]).startswith("SIM-")]
+            changed = self._sync_sim_cut(df, an["acc"])
+            changed = self._sync_auto_cuts(df, real_acc, now) or changed
+            if changed:
+                an = analyze(df, cfg_eff, self.all_cuts(), self.dismissed)
+            events = build_events(df, an["risk"], an["cut"], an["acc"], self.station_info, an["close"], an.get("acc_overflow", 0))
             self._record_stats(df, an)
         self._process_events(sys_events + events, now, hold)
 
@@ -1679,12 +2487,14 @@ class Monitor:
             "riesgo": max((v["score"] for v in an["scores"].values()), default=0)})
 
     def _record(self, ev, now):
-        if self.db_ok and ev["kind"] in INCIDENT_KINDS:
+        if ev["kind"] in ("stopped", "accident") and not self.stations_base:
+            return                       # sin estaciones fiables el aviso suena, pero NO ensucia la memoria de 30 días
+        if self.db_ok and ev["kind"] in INCIDENT_KINDS and not _is_sim(ev):
             db_incident_open(ev["kind"], ev["key"].split("|", 1)[1], now, ev.get("lat"), ev.get("lon"),
                              ev["msg"], SEVERITY[ev["kind"]])
 
     def _on_cleared(self, kind, key, now):
-        if self.db_ok and kind in INCIDENT_KINDS:
+        if self.db_ok and kind in INCIDENT_KINDS and "SIM-" not in key:
             db_incident_close(kind, key.split("|", 1)[1], now)
 
     def _process_events(self, events, now, hold=False):
@@ -1718,6 +2528,7 @@ class Monitor:
         self.alert_state = new_state
         self.active = [dict(s["ev"], first=s["first"]) for s in new_state.values()]
         self._publish(fired)
+        self._flood_summary()
 
     def _publish(self, fired):
         if not fired:
@@ -1736,10 +2547,11 @@ class Monitor:
         for e in fired + ([summary | {"phase": "resumen"}] if summary else []):
             self.events_seq += 1
             e["seq"], e["ts"], e["hora"] = self.events_seq, stamp, hora
+            e["mass"] = e["key"] in mass_keys
             self.events.append(e)
-            if self.db_ok:
+            if self.db_ok and not _is_sim(e):
                 db_log(e)
-            if e["key"] not in mass_keys and self.channels and not self.demo and should_push(e, self.cfg):
+            if e["key"] not in mass_keys and self._can_push(e):
                 self.pool.submit(self._deliver, e)
 
     def _deliver(self, ev):
@@ -1776,17 +2588,23 @@ class Monitor:
             if not tr.has_data():
                 return None
             now = time.time()
-            df = apply_stop_rules(tr.last_df, self.cfg, tr.brake_memory, tr.last_ts)
+            df = apply_stop_rules(tr.last_df, dict(self.cfg, stations_known=bool(self.stations)), tr.brake_memory, tr.last_ts)
             return {
                 "df": df, "fetched_at": tr.last_ts, "last_poll": tr.last_poll_ts,
                 "stale": self.consecutive_errors > 0, "frozen": tr.frozen, "frozen_for": tr.frozen_for(now),
                 "fetch_count": tr.fetch_count, "duplicate_polls": tr.duplicate_polls, "seq": self.events_seq,
                 "active": list(self.active), "last_error": self.last_error, "no_position": tr.no_position,
-                "raw_count": tr.raw_count, "demo": self.demo, "routes": self.routes, "routes_dbg": self.routes_dbg,
+                "raw_count": tr.raw_count, "demo": self.demo, "sim": dict(self.sim, trail=list(self.sim["trail"])), "stations_source": self.stations_source,
+                "learned": len(self.learned), "monitor_stopped": self.user_stopped, "push_on": self.push_enabled,
+                "secondary": self.secondary, "primary_pid": self.primary_pid, "push_suppressed": self.push_suppressed, "routes": self.routes, "routes_dbg": self.routes_dbg,
                 "routes_error": self.routes_error, "stations_error": self.stations_error, "newest_gps_age": tr.newest_gps_age,
                 "thread_alive": bool(self.thread and self.thread.is_alive()),
                 "db_ok": self.db_ok, "poll_s": self.poll_s,
-                "incidents": list(self.incidents), "inc_ok": self.inc_ok,
+                "incidents": [dict(i, fuente=i.get("fuente", "Adif")) for i in self.incidents] + list(self.alerts),
+                "inc_ok": self.inc_ok, "alerts_error": self.alerts_error,
+                "cerc": {"n": len(self.cerc_cache or []), "error": self.cerc_error, "trips_error": self.trips_error,
+                         "delays": sum(1 for t in (self.cerc_cache or []) if t.get("_delay_known")),
+                         "ok_ts": self.cerc_ok_ts},
                 "inc_cfg": bool(self.channels.get("adif_url")), "info": self.station_info,
                 "cuts": self.all_cuts(), "dismissed": set(self.dismissed),
                 "latency_ms": self.latency_ms, "source_ts": tr.source_ts,
@@ -1881,7 +2699,7 @@ A.tone = function(f, at, dur, vol){
   g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
   o.connect(g); g.connect(c.destination); o.start(t0); o.stop(t0 + dur + 0.05);
 };
-A.freqs = {accident:[1000,1600], early:[600,600], brake:[700,950], stopped:[800,1000], risk:[950,1400], system:[500,500]};
+A.freqs = {close:[900,1250], accident:[1000,1600], early:[600,600], brake:[700,950], stopped:[800,1000], risk:[950,1400], system:[500,500]};
 A.play = function(kind, beeps){
   if (!A.ctx || !beeps) return false;
   if (A.ctx.state === 'suspended') { try { A.ctx.resume(); } catch(e) {} }
@@ -1969,7 +2787,12 @@ A.fire = function(o){
   try {
     if (P.Notification && P.Notification.permission === 'granted') {
       evs.slice(0, 3).forEach(function(e){
-        new P.Notification(e.title, {body: e.body, tag: e.tag, requireInteraction: (e.kind === 'risk')});
+        var n = new P.Notification(e.title, {body: e.body, tag: e.tag, requireInteraction: (e.rank >= 3)});
+        n.onclick = function(){
+          try { P.focus(); } catch(x) {}
+          try { if (e.cod) P.history.replaceState(null, '', '?ver=' + encodeURIComponent(e.cod) + '&la=' + (e.lat == null ? '' : e.lat) + '&lo=' + (e.lon == null ? '' : e.lon)); } catch(x) {}
+          try { n.close(); } catch(x) {}
+        };
       });
     }
   } catch(e) {}
@@ -2009,7 +2832,8 @@ def _event_payload(ev):
     lvl = LEVELS[ev["kind"]]
     return {"kind": ev["kind"], "rank": lvl["rank"], "beeps": lvl["beeps"],
             "title": f"{lvl['icon']} {lvl['label']}", "body": ev["msg"],
-            "tag": ev.get("key", "renfe"), "speak": ev.get("speak") or ev["msg"]}
+            "tag": ev.get("key", "renfe"), "speak": ev.get("speak") or ev["msg"],
+            "cod": (ev.get("key", "").split("|") + [""])[1][:32], "lat": ev.get("lat"), "lon": ev.get("lon")}
 
 
 def browser_sync(events, sound, siren_kind, siren_title, token):
@@ -2017,7 +2841,8 @@ def browser_sync(events, sound, siren_kind, siren_title, token):
     payload = {"sound": bool(sound), "events": [_event_payload(e) for e in events],
                "siren": ("hilo" if siren_kind == "risk" else "wail") if siren_kind else None,
                "sirenTitle": siren_title}
-    data = json.dumps(payload).replace("</", "<\\/")
+    data = (json.dumps(payload).replace("</", "<\\/").replace("<!--", "<\\!--")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
     code = (f"<!-- {token} --><script>{BRIDGE_JS}\n"
             "(function(){var P;try{P=window.parent;void P.document;}catch(e){P=window;}"
             f"if(P.__ebmAlarm){{P.__ebmAlarm.sync({data});}}}})();</script>")
@@ -2106,7 +2931,7 @@ def find_clicked_train(df_f, map_data):
         return None
     tip = map_data.get("last_object_clicked_tooltip")
     if tip:
-        cod = str(tip).split(" · ")[0].strip()
+        cod = re.sub(r"<[^>]+>", "", str(tip)).split(" · ")[0].strip()
         match = df_f[df_f["cod_comercial"] == cod]
         if not match.empty:
             return match.iloc[0]
@@ -2143,7 +2968,7 @@ def _carto_key():
         v = st.secrets.get("CARTO_API_KEY")
     except Exception:  # noqa: BLE001
         v = None
-    return str(v or os.getenv("CARTO_API_KEY") or "TU_API_KEY").strip()
+    return str(v or os.getenv("CARTO_API_KEY") or "cb1_3lud_2_aad182c66d1542c744efd474").strip()
 
 
 CARTO_KEY = _carto_key()
@@ -2162,23 +2987,116 @@ def _mon():
     return get_demo_monitor(MONITOR_VERSION) if st.session_state.get("demo_mode") else get_monitor(MONITOR_VERSION)
 
 
+PRESETS = {   # clave del deslizador -> valor
+    "Estricto": {"p_early": 90, "p_minstop": 240, "p_radius": 1500, "p_acc": 900, "p_bms": 1.4, "p_bmin": 120,
+                 "p_rttc": 90, "p_cttc": 90, "p_cclo": 40},
+    "Normal": {"p_early": 45, "p_minstop": 120, "p_radius": 1200, "p_acc": 600, "p_bms": 1.0, "p_bmin": 100,
+               "p_rttc": 120, "p_cttc": 120, "p_cclo": 30},
+    "Sensible": {"p_early": 30, "p_minstop": 60, "p_radius": 1000, "p_acc": 240, "p_bms": 0.9, "p_bmin": 80,
+                 "p_rttc": 120, "p_cttc": 150, "p_cclo": 25},
+}
+
+
+def cb_preset(name):
+    for k, v in PRESETS[name].items():
+        st.session_state[k] = v
+    st.toast(f"Calibración «{name}» aplicada.", icon="🎚")
+
+
+def cb_clear_incidents():
+    db_clear_incidents()
+    st.session_state.clr_ok = False
+    st.toast("Historial de incidentes y eventos borrado.", icon="🧹")
+
+
+def cb_close_card():
+    st.session_state.sel_train = "—"
+
+
+def sensitivity_tables(df, cfg):
+    """Cuántos trenes se marcarían con otros valores (para calibrar sin adivinar)."""
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    base = {**DEFAULT_CFG, **cfg}
+    rt, rr = [], []
+    for v in (30, 60, 90, 120, 180, 300):
+        r = apply_stop_rules(df, dict(base, min_stop_s=v, early_stop_s=max(10, min(base["early_stop_s"], v - 10))), None, None)
+        rt.append({"Detenido tras (s)": v, "Detenidos": int(r["is_stopped"].sum()), "Avisos tempranos": int(r["is_suspect"].sum())})
+    for v in (500, 800, 1000, 1200, 1500, 2000, 3000):
+        r = apply_stop_rules(df, dict(base, station_radius_m=v), None, None)
+        rr.append({"Radio de estación (m)": v, "Detenidos": int(r["is_stopped"].sum())})
+    return pd.DataFrame(rt), pd.DataFrame(rr)
+
+
+def run_selftest(cfg):
+    """Autodiagnóstico: escenarios sintéticos con TU calibración. No toca datos reales ni envía nada."""
+    base = {**DEFAULT_CFG, **{k: v for k, v in cfg.items() if k in DEFAULT_CFG}}
+    t0 = 1_900_000_000.0
+    steps = int((max(base["min_stop_s"], base["accident_s"]) + 120) / 10) + 3
+
+    def T(cod, lat, lon, t, **kw):
+        d = {"codComercial": cod, "codProduct": 2, "latitud": lat, "longitud": lon, "ultRetraso": "0", "time": int(t)}
+        d.update(kw)
+        return d
+
+    def run(make, stations=True):
+        m = Monitor(demo=True)
+        m.cfg.update(base)
+        if stations:
+            m.set_stations([{"code": "S1", "n": "Estación de prueba", "prov": "", "lat": 10.0, "lon": 10.0}])
+        seen = set()
+        for k in range(steps):
+            t = t0 + 10 * k
+            fill = [T(f"F{i}", 41 + i * 0.1 + 0.002 * k, i * 0.1, t) for i in range(12)]
+            m.ingest({"trenes": fill + make(k, t)}, t)
+            seen |= {e["key"] for e in m.active}
+        m.pool.shutdown(wait=False)
+        return seen
+
+    res = []
+    seen = run(lambda k, t: [T("P1", 38.0, -4.0, t, codEstAnt="A", codEstSig="B")])
+    res.append(("Parado lejos de estación → DETENIDO", "stopped|P1" in seen, "stopped|P1"))
+    seen = run(lambda k, t: [T("P2", 38.0, -4.0, t, codEstAnt="S1", codEstSig="S1")])
+    res.append(("Parado «en estación» según el feed → SIN alarma", not any("P2" in x for x in seen), "sin avisos" if not any("P2" in x for x in seen) else str(seen)))
+    seen = run(lambda k, t: [T("P3", 10.0, 10.0, t, codEstAnt="A", codEstSig="B")])
+    res.append(("Parado junto a una estación conocida → SIN alarma", not any("P3" in x for x in seen), "sin avisos" if not any("P3" in x for x in seen) else str(seen)))
+    seen = run(lambda k, t: [T("LEAD", 40.0 + (4000 + 92 * k) / 110540.0, -3.0, t), T("FOLL", 40.0 + 555 * k / 110540.0, -3.0, t)])
+    res.append(("Tren a 200 km/h detrás de otro a 33 km/h → APROXIMACIÓN", any(x.startswith(("close|FOLL", "closecrit|FOLL")) for x in seen),
+                [x for x in seen if "FOLL" in x]))
+    seen = run(lambda k, t: [T("P5", 38.0, -4.0, t, codEstAnt="A", codEstSig="B")])
+    res.append((f"Parado lejos más de {int(base['accident_s'])} s → POSIBLE ACCIDENTE", "accident|P5" in seen, "accident|P5"))
+    seen = run(lambda k, t: [T(f"Q{i}", 38.0 + 0.3 * i, -4.0, t, codEstAnt="A", codEstSig="B") for i in range(5)])
+    res.append(("5 trenes parados a la vez → NO se declaran accidentes (plausibilidad)",
+                not any(x.startswith("accident|") for x in seen) and "sys|plaus" in seen, "descartados" if "sys|plaus" in seen else str(seen)))
+    seen = run(lambda k, t: [T("C1-9", 38.5, -4.0, t, codProduct=200, _src="CERC", _status="STOPPED_AT", codEstAnt="X", codEstSig="X", _delay_known=False)])
+    res.append(("Cercanías «parado en estación» → SIN alarma", not any("C1-9" in x for x in seen), "sin avisos" if not any("C1-9" in x for x in seen) else str(seen)))
+    seen = run(lambda k, t: [T("P8", 38.0, -4.0, t, codEstAnt="A", codEstSig="B")], stations=False)
+    res.append(("Sin estaciones: parado → suena, pero NO se declara accidente",
+                "stopped|P8" in seen and "accident|P8" not in seen, sorted(x for x in seen if "P8" in x)))
+    return res
+
+
 def cb_focus(lat, lon, zoom=11):
     ss = st.session_state
     ss.focus = (float(lat), float(lon), int(zoom))
+    ss.map_center, ss.map_zoom = [float(lat), float(lon)], int(zoom)
     ss.view_nonce = ss.get("view_nonce", 0) + 1
 
 
 def cb_reset_view():
     ss = st.session_state
     ss.focus = None
+    ss.map_center, ss.map_zoom = [40.0, -3.5], 6
     ss.view_nonce = ss.get("view_nonce", 0) + 1
 
 
 def cb_zoom(delta):
     ss = st.session_state
-    lat, lon, z = ss.focus if ss.get("focus") else (40.0, -3.5, 6)
-    ss.focus = (lat, lon, max(4, min(17, int(z) + int(delta))))
-    ss.view_nonce = ss.get("view_nonce", 0) + 1
+    if ss.get("focus"):
+        lat, lon, z = ss.focus
+    else:
+        (lat, lon), z = ss.get("map_center", [40.0, -3.5]), ss.get("map_zoom", 6)
+    cb_focus(lat, lon, max(4, min(17, int(z) + int(delta))))
 
 
 def cb_retry_stations():
@@ -2186,6 +3104,133 @@ def cb_retry_stations():
     mon.stations_try_ts = 0.0
     mon.poll_now()
     st.toast("Reintentando la descarga de estaciones…", icon="🏁")
+
+
+def cb_view(cod, lat, lon):
+    ss = st.session_state
+    ss.sel_train = cod
+    cb_focus(lat, lon, 11)
+
+
+def cb_sim_create(lat, lon, heading, speed, delay):
+    ss = st.session_state
+    _mon().sim_set(active=True, lat=float(lat), lon=float(lon), heading=float(heading), speed=float(speed),
+                   target=float(speed), delay=int(delay), decel=0.8, ts=time.time())
+    ss.sim_target, ss.sim_heading, ss.sim_delay = int(speed), int(heading) % 360, int(delay)
+    cb_focus(lat, lon, 11)
+    st.toast("Tren de prueba creado: 🧪 SIM-001", icon="🧪")
+
+
+def cb_sim_target():
+    _mon().sim_set(target=float(st.session_state.sim_target), decel=0.8)
+
+
+def cb_sim_heading():
+    _mon().sim_set(heading=float(st.session_state.sim_heading))
+
+
+def cb_sim_delay():
+    _mon().sim_set(delay=int(st.session_state.sim_delay))
+
+
+def cb_sim_stop(decel):
+    st.session_state.sim_target = 0
+    _mon().sim_set(target=0.0, decel=float(decel))
+
+
+def cb_sim_halt():
+    st.session_state.sim_target = 0
+    _mon().sim_set(speed=0.0, target=0.0)
+
+
+def cb_sim_delta(delta):
+    ss = st.session_state
+    v = max(0, min(350, int(ss.get("sim_target", 0)) + int(delta)))
+    ss.sim_target = v
+    _mon().sim_set(target=float(v), decel=0.8)
+
+
+def cb_sim_remove():
+    _mon().sim_remove()
+    st.toast("Tren de prueba retirado.", icon="🧪")
+
+
+def station_options(stations):
+    """{etiqueta: (lat, lon)} para desplegables; evita nombres repetidos."""
+    out = {}
+    for s_ in stations:
+        base = (s_.get("n") or s_.get("code") or "estación").strip() or "estación"
+        label = base if base not in out else f"{base} · {s_['lat']:.3f},{s_['lon']:.3f}"
+        out[label] = (s_["lat"], s_["lon"])
+    return out
+
+
+def add_sim_trail(m, trail):
+    folium.PolyLine([list(p) for p in trail], color="#00e5ff", weight=4, opacity=0.9, dash_array="3 7",
+                    tooltip="Recorrido del tren de prueba").add_to(m)
+
+
+def add_sim_marker(m, row):
+    kmh = float(row["speed_kmh"])
+    pop = (f"<div style=\"font-family:Arial\"><b>🧪 SIMULACRO {esc(row['cod_comercial'])}</b><br>Tren de prueba (no real)<br>"
+           f"Velocidad {kmh:.0f} km/h · rumbo {round(row['heading'])}°<br>Baja velocidad: {int(row['stopped_for_s'])} s</div>")
+    folium.Marker(
+        [row["lat"], row["lon"]], tooltip=f"🧪 SIMULACRO · {kmh:.0f} km/h", popup=folium.Popup(pop, max_width=260),
+        icon=folium.DivIcon(icon_size=(0, 0), icon_anchor=(0, 0), html=(
+            '<div style="position:absolute;left:-13px;top:-13px;width:26px;height:26px;background:#000;'
+            'border:3px solid #00e5ff;transform:rotate(45deg);box-shadow:0 0 0 4px rgba(0,229,255,.45)"></div>'
+            '<div style="position:absolute;left:20px;top:-12px;white-space:nowrap;background:#000;color:#00e5ff;'
+            f'font:700 11px Arial;padding:2px 6px;border:1px solid #00e5ff">🧪 SIM · {kmh:.0f} km/h</div>'))).add_to(m)
+
+
+def add_heat(m, df_f, modo, scores, stale_s):
+    """Calor con círculos translúcidos que se acumulan (sin plugins: funciona en todos los modos de mapa)."""
+    if modo == "Apagado" or df_f.empty:
+        return
+    age = pd.to_numeric(df_f["gps_age_s"], errors="coerce")
+    d = df_f[~(age > stale_s) & ~df_f["cod_comercial"].astype(str).str.startswith("SIM-")]
+    if modo == "Retrasos":
+        w = (d["retraso_min"].clip(lower=0) / 30.0).clip(upper=1.0)
+    elif modo == "Riesgo":
+        w = d["cod_comercial"].map(lambda c: scores.get(c, {}).get("score", 0) / 100.0)
+    else:
+        w = pd.Series(0.35, index=d.index)
+    for la, lo, x in zip(d["lat"], d["lon"], w):
+        if x <= 0:
+            continue
+        col = "#2ecc71" if x < 0.34 else ("#f1c40f" if x < 0.67 else "#e74c3c")
+        folium.Circle([float(la), float(lo)], radius=12000 + 18000 * float(x), stroke=False, fill=True,
+                      fill_color=col, fill_opacity=0.10 + 0.12 * float(x)).add_to(m)
+
+
+def cb_load_stations_now():
+    """Descarga el CSV de estaciones de Renfe en el momento y deja el resultado (o el error exacto) en pantalla."""
+    ss = st.session_state
+    mon = _mon()
+    try:
+        est = mon._stations_csv()
+        if est:
+            mon.set_stations(est)
+            save_stations_cache(est)
+            with mon.lock:
+                mon.stations_error, mon.stations_source = None, "Renfe (CSV)"
+            ss.stations_msg = ("ok", f"✅ {len(est)} estaciones cargadas desde el CSV de Renfe (con "
+                                     f"{sum(1 for x in est if x['prov'])} provincias y {sum(1 for x in est if x['code'])} códigos).")
+        else:
+            ss.stations_msg = ("err", "El CSV se descargó pero no encontré estaciones con coordenadas. "
+                                      "Pulsa «🩺 Probar conexión» en SISTEMA para ver el inicio del archivo.")
+    except Exception as e:  # noqa: BLE001 - el botón debe mostrar SIEMPRE la causa
+        ss.stations_msg = ("err", f"❌ No se pudo descargar: {type(e).__name__}: {str(e)[:200]}")
+
+
+def cb_monitor_stop():
+    _mon().stop_user()
+    st.toast("Monitor detenido: no se sondea ni se envía nada.", icon="⏻")
+
+
+def cb_monitor_start():
+    _mon().resume_user()
+    st.toast("Monitor reanudado.", icon="▶")
 
 
 def cb_refresh():
@@ -2225,13 +3270,13 @@ def count_kind(hist_df, kind, secs):
     m = (hist_df["kind"] == kind) & (hist_df["first_ts"] >= time.time() - secs)
     if kind == "accident":
         m &= hist_df["confirmed"] != -1
-    return int(m.sum())
+    return int(hist_df.loc[m, "ref"].nunique())          # trenes DISTINTOS, no filas repetidas
 
 
 def make_base_map(theme, center, zoom):
     """Un único mapa base fijo (sin selector interno): así no cambia de color al refrescar."""
     url, attr, bg = TILES.get(theme, TILES["Claro"])
-    m = folium.Map(location=center, zoom_start=zoom, tiles=None, control_scale=True)
+    m = folium.Map(location=center, zoom_start=zoom, tiles=None, control_scale=True, prefer_canvas=True)
     folium.TileLayer(tiles=url, attr=attr, name="Mapa base", control=False, max_zoom=19).add_to(m)
     m.get_root().header.add_child(folium.Element(f"<style>.leaflet-container{{background:{bg} !important;}}</style>"))
     return m
@@ -2254,7 +3299,7 @@ def add_cuts(m, cuts):
                 '<div style="position:absolute;left:-11px;top:-11px;width:22px;height:22px;background:#ff2d2d;'
                 'border:2px solid #fff;transform:rotate(45deg);box-shadow:0 0 0 4px rgba(255,45,45,.35)"></div>'
                 '<div style="position:absolute;left:18px;top:-10px;white-space:nowrap;background:#ff2d2d;color:#fff;'
-                f'font:700 11px Arial;padding:2px 6px;border-radius:3px">TRAMO CORTADO · {esc(c["name"])[:42]}</div>'))
+                f'font:700 11px Arial;padding:2px 6px;border-radius:3px">TRAMO CORTADO · {esc(str(c["name"])[:42])}</div>'))
         ).add_to(m)
 
 
@@ -2266,7 +3311,7 @@ def add_history(m, hist_df):
         folium.CircleMarker(
             [r["lat"], r["lon"]], radius=4 + 2 * int(r["severity"] or 1), color=col, weight=1, fill=True,
             fill_color=col, fill_opacity=0.35,
-            tooltip=f"{LEVELS[r['kind']]['label']} · {r['ref']} · {fmt_clock(r['first_ts'], '%d/%m %H:%M')}").add_to(m)
+            tooltip=f"{LEVELS[r['kind']]['label']} · {esc(r['ref'])} · {fmt_clock(r['first_ts'], '%d/%m %H:%M')}").add_to(m)
 
 
 def add_trains(m, df_f, info, sel_cod, acc_cods, scores, usar_cluster, stale_s=600):
@@ -2274,11 +3319,17 @@ def add_trains(m, df_f, info, sel_cod, acc_cods, scores, usar_cluster, stale_s=6
     labels = 0
     for _, row in df_f.iterrows():
         cod = row["cod_comercial"]
+        if str(cod).startswith("SIM-"):
+            add_sim_marker(m, row)
+            continue
         is_stopped, is_suspect, is_braking = bool(row["is_stopped"]), bool(row["is_suspect"]), bool(row["braking"])
         is_acc = cod in acc_cods
         stale = pd.notna(row["gps_age_s"]) and row["gps_age_s"] > stale_s
         color = "#8b949e" if stale else ("#ff0000" if is_acc else color_retraso(row["retraso_min"], is_stopped, is_suspect))
-        radius = 14 if is_acc else (12 if is_stopped else (9 if is_suspect else 6))
+        cerc = str(row["src"]) == "CERC"
+        if (not bool(row["delay_known"])) and not (stale or is_acc or is_stopped or is_suspect):
+            color = "#5dade2"   # sin dato de retraso (Cercanías sin trip_updates)
+        radius = 14 if is_acc else (12 if is_stopped else (9 if is_suspect else (4 if cerc else 6)))
         estado = "SIN SEÑAL GPS" if stale else "POSIBLE ACCIDENTE" if is_acc else "DETENIDO" if is_stopped else \
             ("AVISO TEMPRANO" if is_suspect else "En marcha")
         parado = f"Baja velocidad desde hace: {int(row['stopped_for_s'])} s<br>" if row["stopped_for_s"] > 0 else ""
@@ -2291,10 +3342,21 @@ def add_trains(m, df_f, info, sel_cod, acc_cods, scores, usar_cluster, stale_s=6
                f"<span style=\"color:{color};font-weight:bold;\">Estado: {estado}</span><br>"
                f"Velocidad: {row['speed_kmh']} km/h · Rumbo {round(row['heading'])}°<br>{parado}{freno}{gps}"
                f"Retraso: {fmt_delay(row['retraso_min'])} · Riesgo {sc}/100<br>Matrícula: {esc(row['mat'])}</div>")
+        if cerc:   # popup compacto: hay cientos de trenes
+            pop = (f"<b>{esc(cod)}</b> · {esc(row['tipo'])}<br>{estado} · {esc(where_text(row['est_ant'], row['est_sig'], info))}<br>"
+                   + (f"Retraso: {fmt_delay(row['retraso_min'])}" if bool(row["delay_known"]) else "Retraso: sin dato")
+                   + f"<br>Estado GTFS: {esc(row['status'])}")
+        ruta_t = (f"{esc(label_est(row['origen'], info))} → {esc(label_est(row['destino'], info))}<br>"
+                  if (row["origen"] or row["destino"]) else "")
+        tip = (f"<b>{esc(cod)}</b> · {row['speed_kmh']:.0f} km/h<br>{esc(row['tipo'])} · {estado}<br>{ruta_t}"
+               f"{esc(where_text(row['est_ant'], row['est_sig'], info))}<br>"
+               + (f"Retraso: {fmt_delay(row['retraso_min'])}" if bool(row["delay_known"]) else "Retraso: sin dato")
+               + (f"<br>Baja velocidad: {int(row['stopped_for_s'])} s" if row["stopped_for_s"] > 0 else "")
+               + f"<br>Riesgo: {sc}/100")
         marker = folium.CircleMarker(
             location=[row["lat"], row["lon"]], radius=radius, color=color, fill=True, fill_color=color,
             fill_opacity=0.9, weight=2, popup=folium.Popup(pop, max_width=300),
-            tooltip=f"{cod} · {row['speed_kmh']} km/h")
+            tooltip=folium.Tooltip(tip, sticky=True))
         if cluster is not None and not (is_stopped or is_suspect or is_braking):
             marker.add_to(cluster)
         else:
@@ -2325,6 +3387,37 @@ def main():
     ss.setdefault("focus", None)
     stretch = stretch_kwargs(st.button)
 
+    # --- Acceso: si defines EBM_PASSWORD (variable de entorno o st.secrets) la interfaz exige contraseña ---
+    pw = os.getenv("EBM_PASSWORD")
+    if not pw:
+        try:
+            pw = st.secrets.get("EBM_PASSWORD")
+        except Exception:  # noqa: BLE001
+            pw = None
+    if pw and not ss.get("auth_ok"):
+        st.markdown("### 🔒 Emergency Brake Monitor")
+        entered = st.text_input("Contraseña", type="password", key="auth_pw")
+        if entered:
+            if hmac.compare_digest(entered.encode("utf-8"), str(pw).encode("utf-8")):
+                ss.auth_ok = True
+                st.rerun()
+            else:
+                time.sleep(1.0)          # frena la fuerza bruta
+                st.error("Contraseña incorrecta.")
+        return
+
+    try:                                   # clic en una notificación del navegador -> abre ese tren
+        qp = st.query_params
+        ver = qp.get("ver")
+        if ver and re.fullmatch(r"[A-Za-z0-9._#:-]{1,32}", str(ver)):
+            la_, lo_ = to_float(qp.get("la")), to_float(qp.get("lo"))
+            ss.sel_train = str(ver)
+            if la_ is not None and lo_ is not None and -90 <= la_ <= 90 and -180 <= lo_ <= 180:
+                cb_focus(la_, lo_, 11)
+            qp.clear()
+    except Exception:  # noqa: BLE001 - versión sin st.query_params
+        pass
+
     # --- Monitor y primer dato ---
     demo = bool(ss.get("demo_mode", False))
     mon = _mon()
@@ -2334,8 +3427,8 @@ def main():
         ss.pop("last_seq", None)
         ss.siren = None
         ss.siren_ver = ss.get("siren_ver", 0) + 1
-    if not mon.has_stations():
-        mon.set_stations(load_stations() or load_stations_cache())
+    if not mon.stations_base:
+        mon.set_stations(load_stations_cache())
     snap = mon.snapshot()
     if snap is None:
         if demo:
@@ -2366,31 +3459,41 @@ def main():
 
     # ================= PARTE INFERIOR (se rellena primero: los parámetros alimentan todo) =================
     with bottom:
-        t_par, t_cut, t_acc, t_tel, t_can, t_inc, t_reg, t_sis = st.tabs(
-            ["⚙ PARÁMETROS", "🚧 TRAMOS CORTADOS", "💥 ACCIDENTES (30 d)", "📊 TELEMETRÍA", "📡 CANALES",
+        t_par, t_cal, t_cut, t_acc, t_tel, t_can, t_inc, t_reg, t_sis = st.tabs(
+            ["⚙ PARÁMETROS", "🎚 CALIBRAR", "🚧 TRAMOS CORTADOS", "💥 ACCIDENTES (30 d)", "📊 TELEMETRÍA", "📡 CANALES",
              "🛰 INCIDENCIAS ADIF", "📜 REGISTRO", "🩺 SISTEMA"])
 
         with t_par:
             p1, p2, p3 = st.columns(3)
             with p1:
-                early_stop_s = st.slider("Aviso temprano tras (s a baja velocidad)", 10, 180, DEFAULT_CFG["early_stop_s"], 5)
-                min_stop_s = st.slider("Detenido confirmado tras (s)", 20, 300, DEFAULT_CFG["min_stop_s"], 10)
-                station_radius_m = st.slider("Distancia mínima a estación (m)", 200, 3000, DEFAULT_CFG["station_radius_m"], 100)
+                early_stop_s = st.slider("Aviso temprano tras (s a baja velocidad)", 10, 180, DEFAULT_CFG["early_stop_s"], 5, key="p_early")
+                min_stop_s = st.slider("Detenido confirmado tras (s)", 20, 300, DEFAULT_CFG["min_stop_s"], 10, key="p_minstop")
+                station_radius_m = st.slider("Distancia mínima a estación (m)", 200, 3000, DEFAULT_CFG["station_radius_m"], 100, key="p_radius")
                 if early_stop_s >= min_stop_s:
                     st.caption("⚠ El aviso temprano debe ser menor que el tiempo de detenido confirmado.")
-                accident_s = st.slider("Posible accidente: detenido (s) lejos de estación", 60, 900, DEFAULT_CFG["accident_s"], 30)
+                accident_s = st.slider("Posible accidente: detenido (s) lejos de estación", 60, 900, DEFAULT_CFG["accident_s"], 30, key="p_acc")
             with p2:
                 risk_dist_m = st.slider("Distancia de riesgo (m)", 1000, 15000, DEFAULT_CFG["risk_dist_m"], 500)
-                risk_ttc_s = st.slider("Tiempo hasta contacto máx. (s)", 30, 600, DEFAULT_CFG["risk_ttc_s"], 10)
+                risk_ttc_s = st.slider("Tiempo hasta contacto máx. (s)", 30, 600, DEFAULT_CFG["risk_ttc_s"], 10, key="p_rttc")
                 risk_heading_deg = st.slider("Tolerancia de rumbo (°)", 15, 90, DEFAULT_CFG["risk_heading_deg"], 5)
                 risk_min_kmh = st.slider("Velocidad mínima en marcha (km/h)", 10, 200, DEFAULT_CFG["risk_min_kmh"], 5)
             with p3:
-                brake_min_kmh = st.slider("Frenada brusca: velocidad previa mín. (km/h)", 40, 300, DEFAULT_CFG["brake_min_kmh"], 10)
-                brake_ms2 = st.slider("Frenada brusca: deceleración (m/s²)", 0.4, 2.0, float(DEFAULT_CFG["brake_ms2"]), 0.1)
+                brake_min_kmh = st.slider("Frenada brusca: velocidad previa mín. (km/h)", 40, 300, DEFAULT_CFG["brake_min_kmh"], 10, key="p_bmin")
+                brake_ms2 = st.slider("Frenada brusca: deceleración (m/s²)", 0.4, 2.0, float(DEFAULT_CFG["brake_ms2"]), 0.1, key="p_bms")
                 cut_half_km = st.slider("Tramo cortado automático: ± km alrededor del tren", 1, 50, DEFAULT_CFG["cut_half_km"], 1)
                 cut_warn_m = st.slider("Aviso a trenes que se acercan a un tramo cortado (m)", 2000, 30000, DEFAULT_CFG["cut_warn_m"], 1000)
                 risk_include_suspect = st.checkbox("Riesgo también contra trenes con aviso temprano",
                                                    value=DEFAULT_CFG["risk_include_suspect"])
+            st.markdown("**⚡ Aproximación entre trenes** (avisa cuando un tren rápido alcanza a uno más lento que va delante)")
+            ca, cb_, cc, cd = st.columns(4)
+            close_on = ca.checkbox("Activar detección", value=True, key="close_on")
+            close_gap_m = cb_.slider("Hueco máx. a vigilar (m)", 1000, 20000, DEFAULT_CFG["close_gap_m"], 500)
+            close_ttc_s = cc.slider("Alcance en menos de (s)", 30, 600, DEFAULT_CFG["close_ttc_s"], 10, key="p_cttc")
+            close_closing_kmh = cd.slider("Cierre mínimo (km/h)", 5, 100, DEFAULT_CFG["close_closing_kmh"], 5, key="p_cclo")
+            ce, cf, cg = st.columns(3)
+            close_decel = ce.slider("Frenado de servicio supuesto (m/s²)", 0.3, 1.2, float(DEFAULT_CFG["close_decel"]), 0.1)
+            close_lateral_m = cf.slider("Desvío lateral máx. (m)", 50, 1000, DEFAULT_CFG["close_lateral_m"], 50)
+            close_heading_deg = cg.slider("Tolerancia de rumbo entre trenes (°)", 10, 90, DEFAULT_CFG["close_heading_deg"], 5)
             q1, q2, q3 = st.columns(3)
             with q1:
                 st.slider("Refresco de la interfaz (s)", 5, 60, DEFAULT_REFRESH_S, 5, key="refresh_s")
@@ -2402,7 +3505,9 @@ def main():
                    "risk_dist_m": risk_dist_m, "risk_ttc_s": risk_ttc_s, "risk_heading_deg": risk_heading_deg,
                    "risk_min_kmh": risk_min_kmh, "risk_include_suspect": risk_include_suspect,
                    "brake_min_kmh": brake_min_kmh, "brake_ms2": brake_ms2, "accident_s": accident_s,
-                   "cut_half_km": cut_half_km, "cut_warn_m": cut_warn_m}
+                   "cut_half_km": cut_half_km, "cut_warn_m": cut_warn_m, "close_on": close_on,
+                   "close_gap_m": close_gap_m, "close_ttc_s": close_ttc_s, "close_closing_kmh": close_closing_kmh,
+                   "close_decel": close_decel, "close_lateral_m": close_lateral_m, "close_heading_deg": close_heading_deg}
 
         with t_can:
             st.caption("Los avisos salen desde el monitor en segundo plano, aunque no haya ninguna pestaña abierta. "
@@ -2417,8 +3522,20 @@ def main():
                 ntfy_topic = st.text_input("ntfy · topic", key="ui_ntfy_topic")
                 ntfy_server = st.text_input("ntfy · servidor", value="https://ntfy.sh", key="ui_ntfy_server")
                 webhook = st.text_input("Webhook · URL (JSON)", type="password", key="ui_webhook")
-            push_label = st.selectbox("Enviar avisos desde el nivel", list(PUSH_LEVELS.keys()), index=0)
+            push_label = st.selectbox("Enviar avisos desde el nivel", list(PUSH_LEVELS.keys()), index=2)
             cfg["push_min_rank"] = PUSH_LEVELS[push_label]
+            push_on = st.checkbox("📤 Enviar avisos externos (Telegram / ntfy / webhook)", value=True, key="push_on")
+            mon.set_push(push_on)
+            pc1, pc2 = st.columns(2)
+            pc1.button("⏻ Detener el monitor (corta también los envíos)", key="btn_mon_stop", on_click=cb_monitor_stop, **stretch)
+            pc2.button("▶ Reanudar el monitor", key="btn_mon_start", on_click=cb_monitor_start, **stretch)
+            st.caption("Cerrar la pestaña del navegador NO detiene el monitor: sigue en el servidor (por diseño, para vigilar "
+                       "sin pantalla). Para pararlo del todo usa este botón o Ctrl+C en la terminal. Máximo 6 envíos cada 5 min.")
+            for lbl, val, ok_ in (("Adif", adif_url, valid_http_url), ("Webhook", webhook, valid_http_url),
+                                  ("Servidor ntfy", ntfy_server if ntfy_topic else "", valid_http_url),
+                                  ("Topic de ntfy", ntfy_topic, valid_topic)):
+                if val and not ok_(val):
+                    st.warning(f"{lbl}: valor no válido (solo http/https; el topic solo admite letras, números, - y _). Se ignora.")
             mon.update_channels({"telegram_token": tg_token, "telegram_chat": tg_chat, "ntfy_topic": ntfy_topic,
                                  "ntfy_server": ntfy_server if ntfy_topic else "", "webhook_url": webhook,
                                  "adif_url": adif_url})
@@ -2438,13 +3555,14 @@ def main():
     snap = mon.snapshot() or snap
     df = snap["df"]
     info = snap["info"]
-    full_cfg = {**DEFAULT_CFG, **cfg}
+    full_cfg = {**DEFAULT_CFG, **cfg, "stations_known": bool(mon.stations_base)}
     try:
         an = analyze(df, full_cfg, snap["cuts"], snap["dismissed"])
     except Exception as e:  # noqa: BLE001 - un fallo de análisis no puede dejar el mapa vacío
         st.error(f"Fallo en el análisis de riesgo ({type(e).__name__}); se muestran los trenes sin indicadores.")
-        an = {"risk": [], "acc": [], "cut": [], "scores": {}}
+        an = {"risk": [], "acc": [], "cut": [], "close": [], "scores": {}}
     risk_alerts, cut_alerts, acc, scores = an["risk"], an["cut"], an["acc"], an["scores"]
+    close_alerts = an.get("close", [])
     acc_cods = {a["cod"] for a in acc}
     hist_df = db_incidents(RETENTION_DAYS) if snap["db_ok"] else pd.DataFrame(columns=INC_COLUMNS)
     siren_rank = SIREN_LEVELS[ss.get("siren_label", list(SIREN_LEVELS.keys())[0])]
@@ -2453,6 +3571,56 @@ def main():
 
     # ================= PESTAÑAS INFERIORES: tramos, accidentes, telemetría, adif, registro, sistema =================
     with bottom:
+        with t_cal:
+            st.markdown("**🎚 Calibración**: elige la sensibilidad y comprueba qué se marcaría con tus datos de ahora")
+            pc = st.columns(3)
+            pc[0].button("🛡 Estricto (menos alertas)", key="pre_e", on_click=cb_preset, args=("Estricto",), **stretch)
+            pc[1].button("⚖ Normal (recomendado)", key="pre_n", on_click=cb_preset, args=("Normal",), **stretch)
+            pc[2].button("📡 Sensible (más alertas)", key="pre_s", on_click=cb_preset, args=("Sensible",), **stretch)
+            st.caption("Los perfiles mueven los deslizadores de ⚙ PARÁMETROS (aviso temprano, detenido, radio de estación, "
+                       "accidente, frenada y aproximación). Hoy hay temporal (DANA): con mal tiempo es normal que haya más "
+                       "avisos REALES; usa Estricto si quieres solo los más claros.")
+            age_ok = pd.to_numeric(df["gps_age_s"], errors="coerce") if not df.empty else pd.Series(dtype=float)
+            cerc_df = df[df["src"] == "CERC"] if not df.empty else df
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("Estaciones (descargadas + aprendidas)", f"{len(mon.stations_base)} + {snap['learned']}")
+            h2.metric("Trenes con GPS fresco", f"{int((age_ok <= full_cfg['gps_stale_s']).sum())} / {len(df)}" if len(df) else "0")
+            h3.metric("Cercanías con retraso conocido", f"{int(cerc_df['delay_known'].sum())} / {len(cerc_df)}" if len(cerc_df) else "—")
+            h4.metric("Edad del feed", f"{int(now - (snap['source_ts'] or snap['fetched_at']))} s")
+            ev1, ev24 = db_event_counts(1), db_event_counts(24)
+            if not snap["db_ok"]:
+                st.caption("Sin SQLite no hay estadística de alertas.")
+            else:
+                tabla = pd.DataFrame({"Última hora": ev1.groupby("nivel")["n"].sum(), "Últimas 24 h": ev24.groupby("nivel")["n"].sum()}).fillna(0).astype(int)
+                st.markdown("**Alertas nuevas por tipo**")
+                st.dataframe(tabla)
+                if not ev24.empty:
+                    top_ = ev24.assign(tren=ev24["clave"].str.split("|").str[1]).groupby("tren")["n"].sum().nlargest(8)
+                    st.caption("Trenes que más alertas generan (si siempre son los mismos, sospecha de una estación que falta): "
+                               + ", ".join(f"{k} ({v})" for k, v in top_.items()))
+            t_s, t_r = sensitivity_tables(df, full_cfg)
+            if not t_s.empty:
+                x1, x2 = st.columns(2)
+                x1.markdown("**¿Cuántos se marcarían según el tiempo?**")
+                x1.dataframe(t_s, hide_index=True)
+                x2.markdown("**¿Y según el radio de estación?**")
+                x2.dataframe(t_r, hide_index=True)
+            cand = df[(df["is_stopped"] == True) | (df["is_suspect"] == True)] if not df.empty else df  # noqa: E712
+            st.markdown(f"**Trenes marcados ahora: {len(cand)}**")
+            if len(cand):
+                st.dataframe(cand[["cod_comercial", "tipo", "src", "status", "stopped_for_s", "dist_to_station", "gps_age_s", "est_ant", "est_sig"]]
+                             .rename(columns={"cod_comercial": "Tren", "src": "Origen", "stopped_for_s": "Baja vel. (s)",
+                                              "dist_to_station": "A estación (m)", "gps_age_s": "GPS (s)"}), hide_index=True)
+                st.caption("Si ves trenes con «A estación» vacío o muy pequeño, o «en estación» en el feed, son falsos positivos probables.")
+            st.markdown("**✅ Autodiagnóstico** (comprueba que cada regla funciona con TU calibración)")
+            if st.button("▶ Ejecutar autodiagnóstico", key="btn_selftest", **stretch):
+                ss.selftest = run_selftest(full_cfg)
+            if ss.get("selftest"):
+                st.dataframe(pd.DataFrame([{"Prueba": n, "Resultado": "✅ OK" if ok else "❌ FALLA", "Detalle": str(d)[:120]}
+                                           for n, ok, d in ss.selftest]), hide_index=True)
+                bad = sum(1 for _, ok, _ in ss.selftest if not ok)
+                (st.error if bad else st.success)(f"{bad} prueba(s) fallan con esta calibración." if bad else "Todas las reglas responden como se espera.")
+
         with t_cut:
             cl, cr = st.columns([1.3, 1])
             with cl:
@@ -2472,7 +3640,7 @@ def main():
                             st.button("Reabrir", key=f"reopen_{c['id']}", on_click=cb_reopen, args=(c["id"],), **stretch)
             with cr:
                 st.markdown("**Cerrar un tramo a mano**")
-                est_opts = {f"{label_est(code, info)} · {code}": (s["lat"], s["lon"]) for code, s in info.items()}
+                est_opts = station_options(mon.stations)
                 with st.form("form_cut", clear_on_submit=True):
                     name = st.text_input("Nombre / motivo", placeholder="Madrid – Córdoba por accidente")
                     sel_est = st.multiselect("Estaciones del tramo, en orden", sorted(est_opts))
@@ -2497,11 +3665,14 @@ def main():
             a24, a7, a30 = count_kind(hist_df, "accident", 86400), count_kind(hist_df, "accident", 7 * 86400), \
                 count_kind(hist_df, "accident", 30 * 86400)
             k1, k2, k3, k4, k5 = st.columns(5)
-            k1.metric("Posibles accidentes 24 h", a24)
+            k1.metric("Posibles accidentes 24 h (trenes distintos)", a24)
             k2.metric("7 días", a7)
             k3.metric("30 días", a30)
             k4.metric("Detenciones 30 d", count_kind(hist_df, "stopped", 30 * 86400))
             k5.metric("Riesgos 30 d", count_kind(hist_df, "risk", 30 * 86400))
+            with st.expander("🧹 Mantenimiento del historial"):
+                st.checkbox("Confirmo que quiero borrar TODO el historial de incidentes y eventos", key="clr_ok")
+                st.button("🧹 Borrar historial", key="btn_clr", on_click=cb_clear_incidents, disabled=not ss.get("clr_ok"))
             if hist_df.empty:
                 st.caption("Sin incidentes registrados todavía. Se guardan 30 días en SQLite aunque se cierre la aplicación.")
             else:
@@ -2567,18 +3738,24 @@ def main():
                                                      "speed_kmh": "km/h"}), hide_index=True)
 
         with t_inc:
-            if not snap["inc_cfg"]:
-                st.info("Sin fuente de incidencias configurada. Adif no ofrece un JSON público que yo conozca "
-                        "(su web es adif.es/estado-de-la-red). Si dispones de una URL JSON, indícala en ADIF_INCIDENTS_URL o en "
-                        "CANALES: lista o dict con 'incidencias'/'avisos', campos titulo, texto, ambito y, opcionalmente, "
-                        "'tramo': [[lat,lon],[lat,lon]] para dibujar el corte. Mientras tanto usa TRAMOS CORTADOS.")
-            elif snap["inc_ok"] is False:
+            if snap["alerts_error"]:
+                st.warning(f"Avisos oficiales de Renfe (GTFS-RT): no disponibles ({snap['alerts_error']}).")
+            if snap["inc_cfg"] and snap["inc_ok"] is False:
                 st.warning("Adif no responde; se reintenta cada 3 minutos.")
-            for i in snap["incidents"]:
+            if not snap["inc_cfg"]:
+                st.caption("Fuente Adif opcional: indica una URL JSON en ADIF_INCIDENTS_URL o en CANALES "
+                           "(campos titulo, texto, ambito y, si quieres dibujar el corte, 'tramo': [[lat,lon],[lat,lon]]).")
+            niv = {"grave": 0, "leve": 1, "info": 2}
+            if snap["incidents"]:
+                from collections import Counter
+                cnt = Counter(i.get("causa", "Motivo no comunicado") for i in snap["incidents"])
+                st.caption("Causas (deducidas del texto del aviso): " + " · ".join(f"{k} {v}" for k, v in cnt.most_common()))
+            for i in sorted(snap["incidents"], key=lambda x: niv.get(x["nivel"], 3)):
                 st.markdown(f'<div class="inc {i["nivel"]}"><b>{esc(i["titulo"])}</b>{esc(i["texto"])}'
-                            f'<br><small style="color:#7d8da0">{esc(i["ambito"])}</small></div>', unsafe_allow_html=True)
-            if snap["inc_cfg"] and snap["inc_ok"] and not snap["incidents"]:
-                st.caption("Adif no publica ninguna incidencia en este momento.")
+                            f'<br><small style="color:#7d8da0">{esc(i["ambito"])} · {esc(i.get("fuente", ""))} · causa: {esc(i.get("causa", "—"))}</small></div>',
+                            unsafe_allow_html=True)
+            if not snap["incidents"] and not snap["alerts_error"]:
+                st.caption("No hay avisos oficiales activos en este momento.")
 
         with t_reg:
             hist = db_recent(200) if snap["db_ok"] else pd.DataFrame(mon.recent_events(200))
@@ -2597,19 +3774,31 @@ def main():
                 f"Sondeo cada {snap['poll_s']} s · Recibidos del feed: {snap['raw_count']} · Sin posición: {snap['no_position']} · "
                 f"Estaciones cargadas: {len(mon.stations)} · SQLite: {'ok' if snap['db_ok'] else 'no disponible'}"
                 + (f" · Último error: {snap['last_error']}" if snap["last_error"] else ""))
+            _st = mon.stations
+            if _st:
+                st.markdown(f"**Estaciones (detalle):** con código {sum(1 for x in _st if x.get('code'))} · con nombre "
+                            f"{sum(1 for x in _st if x.get('n'))} · con provincia {sum(1 for x in _st if x.get('prov'))} de {len(_st)} · "
+                            f"ejemplo: {[(x.get('code'), x.get('n'), x.get('prov')) for x in _st[:3]]}")
+            cc = snap["cerc"]
+            st.markdown(f"**Red completa (Cercanías/Rodalies/Tram):** {cc['n']} trenes · con retraso conocido {cc['delays']}"
+                        + (f" · último dato hace {int(time.time() - cc['ok_ts'])} s" if cc["ok_ts"] else "")
+                        + (f" · problema posiciones: {cc['error']}" if cc["error"] else "")
+                        + (f" · retrasos no disponibles ({cc['trips_error']})" if cc["trips_error"] else ""))
             dbg = snap["routes_dbg"]
             st.markdown(f"**Rutas y horarios:** {len(snap['routes'])} trenes con paradas"
                         + (f" · registros: {dbg['registros']} · campos del primer registro: {dbg['campos']}" if dbg else "")
                         + (f" · problema: {snap['routes_error']}" if snap["routes_error"] else ""))
             e1, e2 = st.columns([2, 1])
             with e1:
-                st.markdown(f"**Estaciones:** {len(mon.stations)} cargadas"
+                st.markdown(f"**Estaciones:** {len(mon.stations)} cargadas (fuente: {snap['stations_source'] or 'ninguna'})"
                             + (f" · último problema: {snap['stations_error']}" if snap["stations_error"] else ""))
                 up = st.file_uploader("Subir estaciones propias (GeoJSON, o CSV con lat, lon, codigo, nombre, provincia)",
                                       type=["geojson", "json", "csv"], key="up_est")
-                if up is not None and ss.get("up_sig") != (up.name, up.size):
+                if up is not None and up.size > 50 * 1024 * 1024:
+                    st.error("Archivo demasiado grande (máx. 50 MB).")
+                elif up is not None and ss.get("up_sig") != (up.name, up.size):
                     try:
-                        text = up.getvalue().decode("utf-8", "ignore")
+                        text = decode_text(up.getvalue())
                         est = parse_stations_csv(text) if up.name.lower().endswith(".csv") else parse_stations(json.loads(text))
                         if est:
                             mon.set_stations(est)
@@ -2622,6 +3811,7 @@ def main():
                         st.error("Archivo no válido.")
             with e2:
                 st.button("🔄 Reintentar descarga", key="btn_retry_est", on_click=cb_retry_stations, **stretch)
+            st.button("📥 Descargar CSV de Renfe ahora", key="btn_dl_est", on_click=cb_load_stations_now, **stretch)
             st.caption("Emergency Brake Monitor es independiente: no está vinculado a Renfe ni a Adif y usa datos públicos. Las alertas detectan la situación, no sustituyen a los sistemas de seguridad ferroviaria. "
                        "Los datos de posición pueden tener retraso o errores. Los tramos automáticos son aproximados.")
 
@@ -2636,13 +3826,10 @@ def main():
     ss.last_seq = cur_seq
     if new_events:
         pending = list(new_events)
-        for e in new_events:
+        for n_ev, e in enumerate(new_events):
             lvl = LEVELS[e["kind"]]
-            try:
-                st.toast(f"{lvl['label']}: {e['msg']}", icon=lvl["icon"])
-            except Exception:  # noqa: BLE001
-                st.toast(f"{lvl['label']}: {e['msg']}")
-            if e.get("phase") == "nuevo" and lvl["rank"] >= siren_rank and lvl["rank"] > 0:
+            # (sin toast: no se puede pulsar; las alertas son botones en la franja superior y en ALERTAS)
+            if e.get("phase") == "nuevo" and lvl["rank"] >= siren_rank and lvl["rank"] > 0 and not e.get("mass"):
                 arm_siren(e["kind"], e["msg"])
 
     # ================= PARTE SUPERIOR =================
@@ -2677,18 +3864,30 @@ def main():
         else:
             sir_state, sir_txt = "ok", "ARMADA"
         n_risk = len(risk_alerts) + len(cut_alerts)
+        if snap["secondary"]:
+            env_txt, env_state = "COPIA 2ª", "caution"
+        elif not canales:
+            env_txt, env_state = "SIN CANAL", "caution"
+        elif not snap["push_on"] or snap["monitor_stopped"]:
+            env_txt, env_state = "PAUSADOS", "caution"
+        else:
+            env_txt, env_state = "ACTIVOS", "ok"
         st.markdown('<div class="ann-grid">' + "".join([
             ann("Accidente", len(acc), "warn" if acc else "ok"),
+            ann("Aproximación", len(close_alerts), "warn" if close_alerts else "ok"),
             ann("Riesgo", n_risk, "warn" if n_risk else "ok"),
             ann("Detenidos", n_stop, "warn" if n_stop else "ok"),
             ann("Avisos", n_early, "caution" if n_early else "ok"),
             ann("Frenadas", n_brake, "caution" if n_brake else "ok"),
             ann("Tramos cortados", len(snap["cuts"]), "warn" if snap["cuts"] else "ok"),
             ann("Accid. 24 h", a24, "caution" if a24 else "ok"),
-            ann("Estaciones", len(mon.stations) if mon.stations else "SIN DATOS", "ok" if mon.stations else "warn"),
+            ann("Estaciones", f"{len(mon.stations_base)} (+{snap['learned']})" if (mon.stations_base or snap["learned"]) else "SIN DATOS",
+                "ok" if mon.stations_base else "warn"),
             ann("Feed de datos", feed_txt, feed_state),
-            ann("Monitor", "ACTIVO" if snap["thread_alive"] else "CAÍDO", "ok" if snap["thread_alive"] else "warn"),
+            ann("Monitor", "ACTIVO" if snap["thread_alive"] else ("DETENIDO" if snap["monitor_stopped"] else "CAÍDO"),
+                "ok" if snap["thread_alive"] else "warn"),
             ann("Canales", len(canales) if canales else "NINGUNO", "ok" if canales else "caution"),
+            ann("Envíos", env_txt, env_state),
             ann("Sirena", sir_txt, sir_state),
             ann("Memoria 30 d", "SQLITE" if snap["db_ok"] else "NO", "ok" if snap["db_ok"] else "caution"),
         ]) + "</div>", unsafe_allow_html=True)
@@ -2731,6 +3930,13 @@ def main():
                      "Se usará automáticamente el reproductor de respaldo.")
         if not ss.audio_ready:
             st.caption("🔕 Pulsa «Activar alertas» y luego «Probar sirena» para comprobar que suena.")
+        if snap["secondary"]:
+            st.warning(f"⚠ Hay OTRA copia del programa en marcha (PID {snap['primary_pid']}). Esta copia NO envía avisos externos "
+                       "para no duplicarlos. Cierra las demás con «pkill -f streamlit» y arranca solo una.")
+        if snap["monitor_stopped"]:
+            st.warning("⏻ Has detenido el monitor: no se actualizan datos ni se envía nada. Reanúdalo en CANALES.")
+        if snap["push_suppressed"]:
+            st.caption(f"📤 {snap['push_suppressed']} aviso(s) no enviados por el límite anti-saturación.")
         if snap["stale"]:
             st.warning("⚠ Sin conexión con Renfe: se muestra la última lectura válida.")
         if snap["frozen"]:
@@ -2738,9 +3944,16 @@ def main():
                        "la detección está en pausa para evitar falsas alarmas.")
         if snap["fetch_count"] < 2:
             st.info("Primera lectura: velocidad, rumbo y detenciones se calculan desde la segunda actualización.")
-        if not mon.stations:
-            st.error(f"🏁 No hay estaciones cargadas ({snap['stations_error'] or 'descarga pendiente'}). Sin ellas NO se puede "
-                     "detectar un tren detenido en vía. Sube un archivo en la pestaña SISTEMA o reintenta la descarga.")
+        if ss.get("stations_msg"):
+            (st.success if ss.stations_msg[0] == "ok" else st.error)(ss.stations_msg[1])
+        if not mon.stations_base or "PARCIAL" in str(snap["stations_source"]):
+            st.button("📥 DESCARGAR ESTACIONES AHORA (CSV oficial de Renfe)", key="btn_dl_est_top",
+                      on_click=cb_load_stations_now, type="primary", **stretch)
+        if not mon.stations_base:
+            st.error(f"🏁 Sin estaciones cargadas ({snap['stations_error'] or 'descargando de Renfe y OpenStreetMap…'}). "
+                     "Mientras tanto las alarmas de «detenido» saltan SIN descartar estaciones: un tren parado en una "
+                     "estación también avisará (salvo los que el feed marca «en estación»; aprendidas del feed: "
+                     f"{snap['learned']}). Puedes subir un archivo o reintentar en la pestaña SISTEMA.")
         if demo:
             st.warning("🧪 MODO DEMO: trenes SIMULADOS (nada de esto es real, no se envía a Telegram/ntfy ni se guarda). "
                        "En ~2 minutos el tren DEMO-P queda parado y DEMO-A se le acerca: verás accidente, tramo cortado y sirena.")
@@ -2756,27 +3969,63 @@ def main():
 
     # ================= MASTER WARNING + RECONOCER =================
     with alarm_zone:
-        if siren or risk_alerts or cut_alerts or acc:
-            lines = "".join(f"<div>💥 <b>Tren {esc(a['cod'])}</b> ({esc(a['tipo'])}) detenido en vía · {esc(', '.join(a['why']))}</div>"
-                            for a in acc[:4])
-            lines += "".join(
-                f"<div><b>Tren {esc(a['moving'])}</b> ({a['speed_kmh']} km/h) se acerca al <b>tren {esc(a['stopped'])}</b> "
-                f"detenido · {a['dist_m']} m · TTC <b>{a['ttc_s']} s</b></div>" for a in risk_alerts[:4])
-            lines += "".join(
-                f"<div>🚧 <b>Tren {esc(a['moving'])}</b> ({a['speed_kmh']} km/h) se dirige al tramo cortado "
-                f"«{esc(a['cut_name'])}» · {a['dist_m']} m · TTC <b>{a['ttc_s']} s</b></div>" for a in cut_alerts[:4])
+        crit = sorted([e for e in snap["active"] if LEVELS[e["kind"]]["rank"] >= 3], key=lambda e: -LEVELS[e["kind"]]["rank"])
+        if siren or crit:
+            lines = "".join(f"<div>{LEVELS[e['kind']]['icon']} {esc(e['msg'])}</div>" for e in crit[:6])
+            if len(crit) > 6:
+                lines += f"<div>… y {len(crit) - 6} aviso(s) más: míralos en la pestaña ALERTAS.</div>"
             if not lines and siren:
                 lines = f"<div>{esc(siren['msg'])}</div>"
-            head = siren["label"] if siren else ("POSIBLE ACCIDENTE" if acc else "RIESGO CRÍTICO")
+            head = siren["label"] if siren else LEVELS[crit[0]["kind"]]["label"]
             since = f" · lleva {mmss(time.time() - siren['since'])}" if siren else ""
             st.markdown(f'<div class="master"><h4>⚠ MASTER WARNING · {esc(head)}{since}</h4>{lines}</div>',
                         unsafe_allow_html=True)
+            first = next((e for e in crit if e.get("lat") is not None), None)
+            if first:
+                cod_v = first["key"].split("|")[1]
+                st.button(f"🎯 Ver tren {cod_v} en el mapa y en su ficha", key="btn_view", on_click=cb_view,
+                          args=(cod_v, first["lat"], first["lon"]), **stretch)
         if siren:
             tag = "tono de dos notas" if siren["kind"] == "risk" else "barrido continuo"
             st.button(f"✔ RECONOCER Y SILENCIAR SIRENA  ({tag})", key="btn_ack", type="primary",
                       on_click=ack_siren, **stretch)
             if not sound_on:
                 st.caption("🔕 La sirena está armada pero el sonido está desactivado o sin desbloquear en esta pestaña.")
+
+    with alarm_zone:
+        recent = [e for e in sorted(snap["active"], key=lambda e: (-LEVELS[e["kind"]]["rank"], e.get("first", 0)))
+                  if LEVELS[e["kind"]]["rank"] >= 2 and e.get("lat") is not None and "|" in e["key"]][:6]
+        if recent:
+            st.caption("🔔 Alertas activas: pulsa una para ir al tren y ver su información (pasa el ratón para leerla)")
+            cols_ = st.columns(len(recent))
+            for i_, e_ in enumerate(recent):
+                cod_ = e_["key"].split("|")[1]
+                cols_[i_].button(f"{LEVELS[e_['kind']]['icon']} {cod_}", key=f"strip_{i_}", on_click=cb_view,
+                                 args=(cod_, e_["lat"], e_["lon"]), help=e_["msg"][:400], **stretch)
+        sel_ = ss.get("sel_train")
+        if sel_ and sel_ != "—" and not df.empty:
+            cur_ = df[df["cod_comercial"] == sel_]
+            if not cur_.empty:
+                t_ = cur_.iloc[0]
+                sc_ = scores.get(sel_, {"score": 0, "why": []})
+                rn_, _, rcol_ = risk_level(sc_["score"])
+                est_ = "💥 Posible accidente" if sel_ in acc_cods else "🔴 Detenido en vía" if t_["is_stopped"] else \
+                    ("🟠 Aviso temprano" if t_["is_suspect"] else "🟢 En marcha")
+                ruta_ = (f"{esc(label_est(t_['origen'], info))} → {esc(label_est(t_['destino'], info))}"
+                         if (t_["origen"] or t_["destino"]) else esc(t_["mat"] or ""))
+                st.markdown(
+                    f'<div class="ficha"><h3>🚆 {esc(sel_)} · {esc(t_["tipo"])}</h3><div class="r">{ruta_}</div><dl>'
+                    f'<dt>Estado</dt><dd>{est_}</dd><dt>Velocidad</dt><dd>{t_["speed_kmh"]:.0f} km/h</dd>'
+                    f'<dt>Retraso</dt><dd>{fmt_delay(t_["retraso_min"]) if bool(t_["delay_known"]) else "sin dato"}</dd>'
+                    f'<dt>Dónde</dt><dd>{esc(where_text(t_["est_ant"], t_["est_sig"], info)) or "—"}</dd>'
+                    + (f'<dt>Baja velocidad</dt><dd>{mmss(t_["stopped_for_s"])}</dd>' if t_["stopped_for_s"] > 0 else "")
+                    + (f'<dt>A estación</dt><dd>{fmt_m(t_["dist_to_station"])} m</dd>' if t_["dist_to_station"] is not None else "")
+                    + f'<dt>Riesgo</dt><dd style="color:{rcol_}">{sc_["score"]} · {rn_} {esc(" · ".join(sc_["why"]))}</dd></dl></div>',
+                    unsafe_allow_html=True)
+                qc1, qc2, qc3 = st.columns(3)
+                qc1.button("🎯 Centrar mapa", key="card_center", on_click=cb_focus, args=(t_["lat"], t_["lon"], 12), **stretch)
+                qc2.button("🚧 Cortar su tramo", key="card_cut", on_click=cb_cut_train, args=(sel_,), **stretch)
+                qc3.button("✖ Cerrar ficha", key="card_close", on_click=cb_close_card, **stretch)
 
     # ================= CUERPO: filtros, mapa y paneles =================
     with main_zone:
@@ -2798,7 +4047,7 @@ def main():
             usar_cluster = st.checkbox("🗂 Agrupar trenes")
         with f4:
             ver_estaciones = st.checkbox("🏁 Estaciones", value=True, key="ver_est")
-        m1, m2, m3, m4, m5 = st.columns([1.3, 1.1, 1.2, 1.2, 1.4])
+        m1, m2, m3, m4, m5, m6 = st.columns([1.3, 1.1, 1.2, 1.2, 1.4, 1.3])
         with m1:
             map_engine = st.radio("Motor de mapa", ["Interactivo", "Estático (seguro)"], horizontal=True,
                                   key="map_engine", label_visibility="collapsed",
@@ -2812,14 +4061,22 @@ def main():
             ver_hist = st.checkbox("🕘 Historial 30 d", key="ver_hist", help="Puntos de incidentes de los últimos 30 días.")
         with m5:
             remember_view = st.checkbox("🧭 Recordar zoom", key="remember_view",
-                                        help="Desactivado por defecto: en algunas versiones provoca re-renders en bucle.")
+                                        help="Solo para el modo clásico; el modo sin recarga ya recuerda el zoom.")
+            st.checkbox("⚡ Mapa sin recarga", value=True, key="map_dynamic",
+                        help="Actualiza los trenes SIN recargar el mapa: conserva zoom y posición, y los recuadros al pasar el ratón.")
+            st.checkbox("⏸ Pausar mapa", key="map_pause", help="Congela el mapa para explorarlo sin que cambie nada.")
 
-        df_f = df[df["grupo"].isin(grupos_sel)] if not df.empty else df
+        with m6:
+            calor = st.selectbox("Calor", ["Apagado", "Retrasos", "Densidad", "Riesgo"], index=1, key="calor",
+                                 format_func=lambda x: f"🔥 {x}", label_visibility="collapsed",
+                                 help="Mapa de calor: dónde se concentran los retrasos, los trenes o el riesgo.")
+
+        df_f = df[df["grupo"].isin(list(grupos_sel) + ["Simulacro"])] if not df.empty else df
         if filtro_parados and not df_f.empty:
             df_f = df_f[(df_f["is_stopped"] == True) | (df_f["is_suspect"] == True)]  # noqa: E712
 
         total = len(df_f)
-        ret_clip = df_f["retraso_min"].clip(lower=0) if total else pd.Series(dtype=float)
+        ret_clip = df_f.loc[df_f["delay_known"], "retraso_min"].clip(lower=0) if total else pd.Series(dtype=float)
         retrasados = int((df_f["retraso_min"] >= 5).sum()) if total else 0
         mediana = float(ret_clip.median()) if total else 0.0
         maximo = int(df_f["retraso_min"].max()) if total else 0
@@ -2849,50 +4106,110 @@ def main():
                         '<span style="--c:#e67e22">16-30</span><span style="--c:#e74c3c">&gt;30</span>'
                         '<span style="--c:#ff9f1a">aviso temprano</span><span style="--c:#ff3232">detenido</span>'
                         '<span style="--c:#ff0000">posible accidente</span><span style="--c:#bd5fff">frenada brusca</span>'
-                        '<span style="--c:#ff2d2d">tramo cortado ▬ ▬</span></div>', unsafe_allow_html=True)
+                        '<span style="--c:#ff2d2d">tramo cortado ▬ ▬</span><span style="--c:#5dade2">sin dato de retraso</span></div>', unsafe_allow_html=True)
+            sim_s = snap["sim"]
+            map_key_extra = ""
+            follow = bool(sim_s["active"] and ss.get("sim_follow"))
+            use_static = not map_engine.startswith("Interactivo")
+            try:
+                f_sig = inspect.signature(st_folium).parameters
+            except (TypeError, ValueError):
+                f_sig = {}
+            dyn = (not use_static) and bool(ss.get("map_dynamic", True)) and "feature_group_to_add" in f_sig \
+                and not ss.get("_dyn_failed")
             focus = ss.get("focus")
-            if focus:
+            if follow:
+                center, zoom = [sim_s["lat"], sim_s["lon"]], 12
+                map_key_extra = f"f{int(sim_s['lat'] * 1e4)}"
+            elif focus:
                 center, zoom = [focus[0], focus[1]], focus[2]
-            elif remember_view:
+                if dyn:                       # en modo sin recarga la vista la guarda el propio mapa
+                    ss.map_center, ss.map_zoom, ss.focus = list(center), zoom, None
+            elif dyn or remember_view:
                 center, zoom = ss.get("map_center", [40.0, -3.5]), ss.get("map_zoom", 6)
             else:
                 center, zoom = [40.0, -3.5], 6
-            m = make_base_map(theme, center, zoom)
 
-            if ver_estaciones and mon.has_stations():
-                fg_est = folium.FeatureGroup(name="Estaciones", show=True)
-                for s in mon.stations:
-                    folium.CircleMarker([s["lat"], s["lon"]], radius=4, color="#1f5fa8", fill=True, fill_color="#3b8eea",
+            def est_group():
+                if not (ver_estaciones and mon.has_stations()):
+                    return None
+                fg_e = folium.FeatureGroup(name="Estaciones", show=True)
+                for s_ in mon.stations:
+                    folium.CircleMarker([s_["lat"], s_["lon"]], radius=4, color="#1f5fa8", fill=True, fill_color="#3b8eea",
                                         fill_opacity=0.85, weight=1,
-                                        tooltip=(s["n"] or s["code"] or "estación")).add_to(fg_est)
-                fg_est.add_to(m)
-            for fn, args in ((add_history, (m, hist_df)), (add_cuts, (m, snap["cuts"]))):
-                if (fn is add_history and not (ver_hist and not hist_df.empty)) or (fn is add_cuts and not ver_tramos):
-                    continue
+                                        tooltip=esc(s_["n"] or s_["code"] or "estación")).add_to(fg_e)
+                return fg_e
+
+            def draw(target):
+                for fn, args in ((add_history, (target, hist_df)), (add_cuts, (target, snap["cuts"]))):
+                    if (fn is add_history and not (ver_hist and not hist_df.empty)) or (fn is add_cuts and not ver_tramos):
+                        continue
+                    try:
+                        fn(*args)
+                    except Exception as e:  # noqa: BLE001 - las capas extra nunca bloquean los trenes
+                        st.caption(f"⚠ Capa omitida ({type(e).__name__}).")
                 try:
-                    fn(*args)
-                except Exception as e:  # noqa: BLE001 - las capas extra nunca bloquean los trenes
-                    st.caption(f"⚠ Capa omitida ({type(e).__name__}).")
-            add_trains(m, df_f, info, ss.get("sel_train"), acc_cods, scores, usar_cluster, full_cfg["gps_stale_s"])
-            st.caption(f"🚆 {len(df_f)} trenes dibujados de {len(df)} con posición · 🏁 {len(mon.stations)} estaciones cargadas"
-                       f"{'' if ver_estaciones else ' (ocultas)'} · tema de mapa: {theme}")
+                    add_heat(target, df_f, calor, scores, full_cfg["gps_stale_s"])
+                except Exception as e:  # noqa: BLE001
+                    st.caption(f"⚠ Capa de calor omitida ({type(e).__name__}).")
+                if sim_s["active"] and len(sim_s["trail"]) > 1:
+                    add_sim_trail(target, sim_s["trail"])
+                add_trains(target, df_f, info, ss.get("sel_train"), acc_cods, scores, usar_cluster, full_cfg["gps_stale_s"])
+
+            groups = None
+            if dyn and ss.get("map_pause") and ss.get("_map_obj") is not None:
+                m, groups = ss._map_obj                       # mapa congelado: se reutiliza tal cual
+                st.caption("⏸ Mapa en pausa: no se actualiza hasta que lo reactives.")
+            else:
+                m = make_base_map(theme, center, zoom)
+                if dyn:
+                    fg_main = folium.FeatureGroup(name="Datos", show=True)
+                    draw(fg_main)
+                    groups = [fg_main]
+                    ek = (len(mon.stations), bool(ver_estaciones))
+                    cache = ss.get("_est_cache")
+                    fg_e = cache[1] if (cache and cache[0] == ek) else est_group()
+                    ss._est_cache = (ek, fg_e)
+                    if fg_e is not None:
+                        groups.append(fg_e)
+                    ss._map_obj = (m, groups)
+                else:
+                    fg_e = est_group()
+                    if fg_e is not None:
+                        fg_e.add_to(m)
+                    draw(m)
+                st.caption(f"🚆 {len(df_f)} trenes dibujados de {len(df)} con posición · 🏁 {len(mon.stations)} estaciones cargadas"
+                           f"{'' if ver_estaciones else ' (ocultas)'} · tema: {theme} · {'⚡ sin recarga' if dyn else 'modo clásico'}")
 
             map_data = None
-            use_static = not map_engine.startswith("Interactivo")
             if not use_static:
                 returned = ["last_object_clicked", "last_object_clicked_tooltip"]
-                if remember_view:
+                if dyn or remember_view:
                     returned += ["center", "zoom"]
+                skey = f"mapa_{theme}_{ss.view_nonce}{map_key_extra}"
                 try:
-                    map_data = st_folium(m, key=f"mapa_{theme}_{ss.view_nonce}", use_container_width=True, height=620,
-                                         returned_objects=returned)
+                    if dyn:
+                        kw = {"feature_group_to_add": groups}
+                        if "center" in f_sig and "zoom" in f_sig:
+                            kw.update(center=center, zoom=zoom)
+                        map_data = st_folium(m, key=skey, use_container_width=True, height=620, returned_objects=returned, **kw)
+                    else:
+                        map_data = st_folium(m, key=skey, use_container_width=True, height=620, returned_objects=returned)
+                except TypeError:
+                    if dyn:                       # versión sin soporte para actualizar capas: vuelve al modo clásico
+                        ss._dyn_failed = True
+                        st.rerun()
+                    use_static = True
                 except Exception as e:  # noqa: BLE001 - el mapa nunca debe tumbar la herramienta
+                    if dyn:
+                        ss._dyn_failed = True        # primero se reintenta en modo clásico
+                        st.rerun()
                     st.error(f"El mapa interactivo falló ({type(e).__name__}); se muestra el mapa estático.")
                     use_static = True
             if use_static:
                 st.caption("🗺 Mapa estático: se dibuja siempre, pero sin clic en trenes (usa el popup de cada punto).")
                 render_html(m.get_root().render(), height=640)
-            if map_data and remember_view:
+            if map_data and (dyn or remember_view):
                 c, z = map_data.get("center"), map_data.get("zoom")
                 if c and z:
                     ss.map_center = [c["lat"], c["lng"]]
@@ -2905,7 +4222,7 @@ def main():
                     ss.sel_train = clicked["cod_comercial"]
 
         with col_panel:
-            tab_arr, tab_al, tab_rk, tab_tren, tab_list = st.tabs(["⏱ RETRASOS", "🚨 ALERTAS", "🎚 RIESGO", "🚆 TREN", "📋 TRENES"])
+            tab_arr, tab_al, tab_rk, tab_tren, tab_list, tab_sim = st.tabs(["⏱ RETRASOS", "🚨 ALERTAS", "🎚 RIESGO", "🚆 TREN", "📋 TRENES", "🧪 SIM"])
 
             with tab_al:
                 active = sorted(snap["active"], key=lambda e: -LEVELS[e["kind"]]["rank"])
@@ -2913,11 +4230,16 @@ def main():
                     st.markdown('<div class="eicas"><div class="nominal">● SISTEMA NOMINAL — sin trenes detenidos '
                                 'lejos de estaciones.</div></div>', unsafe_allow_html=True)
                 else:
-                    body = "".join(
-                        f'<div class="msg {"risk" if e["kind"] == "accident" else e["kind"]}"><b>{LEVELS[e["kind"]]["icon"]} '
-                        f'{LEVELS[e["kind"]]["label"]} · {mmss(time.time() - e.get("first", time.time()))}</b>{esc(e["msg"])}</div>'
-                        for e in active[:25])
-                    st.markdown(f'<div class="eicas">{body}</div>', unsafe_allow_html=True)
+                    st.caption("Pulsa «🎯 Ver» para centrar el mapa y abrir la ficha del tren (arriba, sobre el mapa).")
+                    for i_a, e in enumerate(active[:12]):
+                        cls = "risk" if e["kind"] == "accident" else e["kind"]
+                        st.markdown(
+                            f'<div class="eicas"><div class="msg {cls}"><b>{LEVELS[e["kind"]]["icon"]} {LEVELS[e["kind"]]["label"]}'
+                            f' · {mmss(time.time() - e.get("first", time.time()))}</b>{esc(e["msg"])}</div></div>', unsafe_allow_html=True)
+                        if e.get("lat") is not None and "|" in e["key"]:
+                            st.button("🎯 Ver", key=f"alv_{i_a}", on_click=cb_view, args=(e["key"].split("|")[1], e["lat"], e["lon"]))
+                    if len(active) > 12:
+                        st.caption(f"… y {len(active) - 12} más")
 
             with tab_rk:
                 st.markdown(f'<div class="riskbox {lvl_cls}"><b>{top_score}</b><div><span>ÍNDICE DE RIESGO DE LA RED</span><br>'
@@ -2953,29 +4275,29 @@ def main():
                 ret = df_f[df_f["retraso_min"] >= min_ret] if total else df_f
                 n_zona_antes = len(ret)
                 if not ret.empty:
-                    ret = ret[ret["destino"].map(lambda c: in_zone(zona, c, info))].sort_values("retraso_min", ascending=False)
+                    ret = ret[ret.apply(lambda r: train_in_zone(zona, r, info), axis=1)].sort_values("retraso_min", ascending=False)
                 if len(ret):
                     st.caption(f"{len(ret)} tren(es) con {min_ret} min de retraso o más · derecha: llegada al destino "
                            "(tachada = prevista, debajo = estimada)" if snap["routes"] else
                            f"{len(ret)} tren(es) con {min_ret} min de retraso o más · sin horarios de destino: "
                            "se muestra la próxima parada")
                 elif n_zona_antes:
-                    st.caption("Ninguno en esta zona (si falta la provincia de las estaciones, usa «Toda España»).")
+                    st.caption("Ninguno en esta zona ahora mismo. (Si no se conoce el destino, se usa la posición actual del tren.)")
                 else:
                     st.caption(f"Ningún tren de los elegidos tiene {min_ret} min de retraso o más.")
                 ver_todos = st.checkbox("Ver todos", key="arr_all") if len(ret) > 12 else False
                 rows_html = ""
                 for _, t in (ret if ver_todos else ret.head(12)).iterrows():
                     nv = "grave" if t["retraso_min"] >= 15 else "leve"
-                    where = (f"En {esc(label_est(t['est_ant'], info))}" if t["est_ant"] == t["est_sig"]
-                             else f"Entre {esc(label_est(t['est_ant'], info))} y {esc(label_est(t['est_sig'], info))}")
+                    where = esc(where_text(t["est_ant"], t["est_sig"], info)) or "—"
+                    ruta = (f'{esc(label_est(t["origen"], info))} → {esc(label_est(t["destino"], info))}'
+                            if (t["origen"] or t["destino"]) else esc(t["mat"] or t["cod_comercial"]))
                     plan = planned_arrival(snap["routes"], t["cod_comercial"], t["destino"])
                     hs = (f"<del>{plan}</del>{add_minutes_hhmm(plan, max(0, int(t['retraso_min'])))}" if plan else
                           (f"{esc(label_est(t['est_sig'], info))}<br>{esc(t['hora_sig'])}" if t["hora_sig"] else ""))
                     rows_html += (
                         f'<div class="arr {nv}"><div class="min">+{int(t["retraso_min"])}</div>'
-                        f'<div><div class="t">{esc(t["tipo"])} {esc(label_est(t["origen"], info))} → '
-                        f'{esc(label_est(t["destino"], info))}<small>{esc(t["cod_comercial"])}</small></div>'
+                        f'<div><div class="t">{esc(t["tipo"])} {ruta}<small>{esc(t["cod_comercial"])}</small></div>'
                         f'<div class="d">{where}</div></div><div class="h">{hs}</div></div>')
                 if rows_html:
                     st.markdown(rows_html, unsafe_allow_html=True)
@@ -2997,8 +4319,7 @@ def main():
                     rn, _, rcol = risk_level(sc["score"])
                     est = "💥 Posible accidente" if cod in acc_cods else "🔴 Detenido en vía" if t["is_stopped"] else \
                         ("🟠 Aviso temprano" if t["is_suspect"] else "🟢 En marcha")
-                    where = (f"En {esc(label_est(t['est_ant'], info))}" if t["est_ant"] == t["est_sig"]
-                             else f"Entre {esc(label_est(t['est_ant'], info))} y {esc(label_est(t['est_sig'], info))}")
+                    where = esc(where_text(t["est_ant"], t["est_sig"], info)) or "—"
                     vel_txt = "Parado" if t["speed_kmh"] < 4 else "≈ %d km/h" % round(t["speed_kmh"])
                     gps_txt = f"hace {int(t['gps_age_s'])} s" if pd.notna(t["gps_age_s"]) else "—"
                     spark = sparkline(snap["hist"].get(cod, []))
@@ -3013,6 +4334,8 @@ def main():
                         + (f'<dt>Deceleración</dt><dd>{t["decel_ms2"]:.2f} m/s²</dd>' if t["decel_ms2"] > 0.1 else "")
                         + (f'<dt>Rumbo</dt><dd>{round(t["heading"])}°</dd>' if t["has_heading"] else "")
                         + f'<dt>Dónde</dt><dd>{where}</dd>'
+                        + (f'<dt>Fuente</dt><dd>{"Cercanías (GTFS-RT)" if t["src"] == "CERC" else "Larga distancia"}'
+                           f' {esc(t["status"])}</dd>')
                         + (f'<dt>Próx. parada</dt><dd>{esc(t["hora_sig"])}</dd>' if t["hora_sig"] else "")
                         + (lambda p: (f'<dt>Llegada prevista</dt><dd>{p}</dd><dt>Llegada estimada</dt>'
                                       f'<dd>{add_minutes_hhmm(p, max(0, int(t["retraso_min"])))}</dd>') if p else "")(
@@ -3047,6 +4370,79 @@ def main():
                 st.dataframe(vista.rename(columns={"cod_comercial": "Tren", "tipo": "Tipo", "retraso_min": "Retraso",
                                                    "speed_kmh": "km/h", "riesgo": "Riesgo", "stopped_for_s": "Baja vel. (s)"}),
                              hide_index=True)
+
+    with col_panel:
+        with tab_sim:
+            sim = snap["sim"]
+            st.caption("Tren virtual 🧪 SIM-001 (rombo negro con borde cian). Pasa por las mismas reglas que los trenes "
+                       "reales, pero sus avisos NO se envían a Telegram/ntfy ni se guardan en la memoria de 30 días.")
+            if not sim["active"]:
+                preset = st.radio("Dónde colocarlo", ["Vía lejos de estaciones", "En una estación",
+                                                      "Detrás del tren seleccionado", "Coordenadas"], key="sim_preset")
+                lat0, lon0, hdg0, ok_place = DEMO_SPOT[0], DEMO_SPOT[1], 0, True
+                if preset == "En una estación":
+                    opts = station_options(mon.stations)
+                    if opts:
+                        k_ = st.selectbox("Estación", sorted(opts), key="sim_station")
+                        lat0, lon0 = opts[k_]
+                    else:
+                        st.caption("No hay estaciones cargadas todavía.")
+                        ok_place = False
+                elif preset == "Detrás del tren seleccionado":
+                    sel_ = ss.get("sel_train", "—")
+                    cur_ = df[df["cod_comercial"] == sel_] if (sel_ != "—" and not df.empty) else df.iloc[0:0]
+                    if cur_.empty or not bool(cur_.iloc[0]["has_heading"]):
+                        st.caption("Primero selecciona un tren EN MARCHA (clic en el mapa o pestaña TREN).")
+                        ok_place = False
+                    else:
+                        t_ = cur_.iloc[0]
+                        gap_km = st.slider("Distancia detrás (km)", 1, 15, 6, key="sim_gap")
+                        lat0, lon0 = offset_point(t_["lat"], t_["lon"], t_["heading"] + 180, gap_km * 1000)
+                        hdg0 = float(t_["heading"])
+                        st.caption(f"Se coloca detrás del tren {t_['cod_comercial']} ({t_['speed_kmh']:.0f} km/h), mismo rumbo.")
+                elif preset == "Coordenadas":
+                    lat0 = st.number_input("Latitud", value=40.0, format="%.5f", key="sim_lat")
+                    lon0 = st.number_input("Longitud", value=-3.5, format="%.5f", key="sim_lon")
+                if preset != "Detrás del tren seleccionado":
+                    hdg0 = st.slider("Rumbo (° · 0 norte, 90 este)", 0, 359, 0, 5, key="sim_hdg0")
+                v0 = st.slider("Velocidad inicial (km/h)", 0, 350, 120, 5, key="sim_v0")
+                d0 = st.slider("Retraso (min)", -5, 120, 0, 1, key="sim_d0")
+                st.button("➕ Crear tren de prueba", key="sim_create", on_click=cb_sim_create,
+                          args=(lat0, lon0, hdg0, v0, d0), disabled=not ok_place, **stretch)
+            else:
+                st.slider("Velocidad objetivo (km/h)", 0, 350, int(ss.get("sim_target", sim["target"])), 5,
+                          key="sim_target", on_change=cb_sim_target)
+                st.slider("Rumbo (°)", 0, 359, int(ss.get("sim_heading", sim["heading"])), 5,
+                          key="sim_heading", on_change=cb_sim_heading)
+                st.slider("Retraso (min)", -5, 120, int(ss.get("sim_delay", sim["delay"])), 1,
+                          key="sim_delay", on_change=cb_sim_delay)
+                x1, x2 = st.columns(2)
+                x1.button("▶ Arrancar", key="sim_go", on_click=cb_sim_target, **stretch)
+                x2.button("⏸ Parar suave", key="sim_soft", on_click=cb_sim_stop, args=(0.8,), **stretch)
+                x3, x4 = st.columns(2)
+                x3.button("🛑 Frenada brusca", key="sim_hard", on_click=cb_sim_stop, args=(2.4,), **stretch)
+                x4.button("⛔ Parar ya", key="sim_halt", on_click=cb_sim_halt, **stretch)
+                x5, x6 = st.columns(2)
+                x5.button("⏩ +20 km/h", key="sim_up", on_click=cb_sim_delta, args=(20,), **stretch)
+                x6.button("⏪ −20 km/h", key="sim_dn", on_click=cb_sim_delta, args=(-20,), **stretch)
+                st.checkbox("🎯 Seguir al tren de prueba en el mapa", key="sim_follow",
+                            help="Centra el mapa en el tren en cada actualización (se mueve ~300-500 m por actualización a 120 km/h).")
+                st.button("❌ Quitar tren de prueba", key="sim_rm", on_click=cb_sim_remove, **stretch)
+                row_ = df[df["cod_comercial"] == SIM_ID] if not df.empty else df
+                st.markdown(f"**Ahora:** {sim['speed']:.0f} km/h (objetivo {sim['target']:.0f}) · rumbo {sim['heading']:.0f}° · "
+                            f"{sim['lat']:.4f}, {sim['lon']:.4f}")
+                if not row_.empty:
+                    r_ = row_.iloc[0]
+                    sc_ = scores.get(SIM_ID, {"score": 0, "why": []})
+                    st.caption(f"Medido por el monitor: {r_['speed_kmh']:.0f} km/h · baja velocidad {mmss(r_['stopped_for_s'])} · "
+                               f"estación a {fmt_m(r_['dist_to_station'])} m · riesgo {sc_['score']} ({', '.join(sc_['why']) or '—'})")
+                evs_ = [e for e in snap["active"] if "SIM-" in e["key"] or e["key"].endswith("|sim_cut")]
+                if evs_:
+                    for e_ in evs_:
+                        st.warning(f"{LEVELS[e_['kind']]['icon']} {e_['msg']}")
+                else:
+                    st.caption("Sin alertas para el tren de prueba. (Parado dentro de una estación NO debe alarmar; "
+                               "«detenido» necesita estar parado el tiempo configurado en PARÁMETROS.)")
 
     # ================= SINCRONIZACIÓN CON EL NAVEGADOR (una vez por ejecución) =================
     siren = ss.get("siren")
