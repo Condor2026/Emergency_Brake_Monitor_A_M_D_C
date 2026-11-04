@@ -2968,7 +2968,7 @@ def _carto_key():
         v = st.secrets.get("CARTO_API_KEY")
     except Exception:  # noqa: BLE001
         v = None
-    return str(v or os.getenv("CARTO_API_KEY") or "cb1_3lud_2_aad182c66d1542c744efd474").strip()
+    return str(v or os.getenv("CARTO_API_KEY") or "TU_API_KEY_CARTO").strip()
 
 
 CARTO_KEY = _carto_key()
