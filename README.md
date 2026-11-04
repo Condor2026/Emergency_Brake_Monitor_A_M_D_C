@@ -1,7 +1,13 @@
-
 # 🚆 Emergency Brake Monitor (A.M.D.C.)
 ![TheCondor](EmergencyBrakeMonitorCondor.jpg)
-
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Streamlit](https://img.shields.io/badge/Streamlit-1.30%2B-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
+[![Folium](https://img.shields.io/badge/Folium-0.15%2B-77B829?logo=leaflet&logoColor=white)](https://python-visualization.github.io/folium/)
+[![Pandas](https://img.shields.io/badge/Pandas-2.0%2B-150458?logo=pandas&logoColor=white)](https://pandas.pydata.org/)
+[![NumPy](https://img.shields.io/badge/NumPy-1.24%2B-013243?logo=numpy&logoColor=white)](https://numpy.org/)
+[![SQLite](https://img.shields.io/badge/SQLite-3-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
+[![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
+[![Prototype](https://img.shields.io/badge/Status-Prototype-yellow)](https://github.com/Condor2026/EmergencyBrakeMonitor)
 > **Prototipo experimental.** Herramienta de observación y alerta temprana para el seguimiento de trenes en tiempo real. Publicada como código abierto para que la comunidad pueda revisarla, mejorarla y utilizarla.
 
 ---
