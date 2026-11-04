@@ -203,8 +203,7 @@ Puedes configurar canales de aviso mediante variables de entorno o `st.secrets`:
 - **Comunidad:** A todos los que creen que la tecnología debe estar al servicio de la seguridad y el bien común.
 
 ## 📄 Licencia
-
-Este proyecto se distribuye bajo la licencia **MIT**. Eres libre de usarlo, modificarlo y distribuirlo, siempre que se mantenga el aviso de copyright y se reconozca la autoría original.
+- CC BY-NC-SA.
 
 > **"Que la alarma suene antes de que la única opción sea accionar el freno a mano."**
 > 
