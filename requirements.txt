@@ -1,6 +1,6 @@
 # ==========================================
 # requirements.txt
-# Emergency Brake Monitor (A.M.D.C.)
+# Emergency Brake Monitor (A.M.D.C.) — Condor2026
 # ==========================================
 # Instalación:
 #   pip install -r requirements.txt
@@ -20,5 +20,5 @@ folium>=0.15.0
 pandas>=2.0.0
 numpy>=1.24.0
 
-# --- Peticiones HTTP (feed de Renfe, Telegram, ntfy, webhooks) ---
+# --- Peticiones HTTP (feed de Renfe, GTFS-RT, Telegram, ntfy, webhooks, Overpass) ---
 requests>=2.31.0
