@@ -19,8 +19,8 @@
 
 ## 📖 La historia detrás del proyecto
 
-Hace pocos días, un civil desarrolló una aplicación para avisar de los retrasos de Renfe. Le llovieron las críticas. Se le acusó de falta de innovación, de que era un "prototipo básico" y de que no aportaba nada nuevo. El chico se defendió: *"Si yo pude, ¿por qué no lo hizo Renfe?"*. Pero la presión y el acoso hicieron que este pusiera candado en su cuenta de X. 
-
+Hace pocos días, un civil desarrolló una aplicación para avisar de los retrasos de Renfe. Le llovieron las críticas. Se le acusó de falta de innovación, de que era un "prototipo básico" y de que no aportaba nada nuevo. El chico se defendió: *"Si yo pude, ¿por qué no lo hizo Renfe?"*. Pero la presión y el acoso hicieron que este pusiera candado en su cuenta de X.
+![TheCondor](VíaLibre.png)
 Mientras todo eso pasaba, yo estaba construyendo otra cosa. Mientras otros se limitaban a criticar al chico y a decir que su idea no era innovadora, yo, que programo, pensaba en cómo mejorarla. Tenía ideas. Y me cabreé.
 
 Así nació **Emergency Brake Monitor**, un sistema que lleva las siglas **A.M.D.C.** grabadas en su nombre. No son siglas técnicas ni un acrónimo de laboratorio. Son las iniciales de **los dos maquinistas que, la semana pasada, perdieron la vida en el accidente ferroviario de España**. Ellos, como tantos otros antes, **accionaron la palanca del freno como última opción**. No pudieron evitar el impacto, pero lo intentaron hasta el final. Este proyecto va en su memoria, y en la de todas las víctimas. Pero, sobre todo, es una promesa: **que otros no pasen por lo mismo**. Que la próxima vez, la alarma suene antes de que la única opción sea accionar el freno a mano.
