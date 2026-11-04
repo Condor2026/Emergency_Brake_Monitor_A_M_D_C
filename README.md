@@ -185,7 +185,8 @@ Creo firmemente que la seguridad ferroviaria es un **bien común**. No debería 
 - Python 3.9 o superior.
 - Conexión a Internet (para obtener datos de Renfe).
 - Navegador web moderno (Chrome, Firefox, Edge).
-
+- En la linea 2974 agrega tu API KEY CARTO. (CARTO_KEY = _carto_key)
+  
 ### Instalación
 ```bash
 pip install streamlit streamlit-folium streamlit-autorefresh folium pandas numpy requests
